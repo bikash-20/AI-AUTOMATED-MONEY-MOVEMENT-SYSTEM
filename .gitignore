@@ -1,0 +1,31 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+backend/.venv/
+backend/.env
+
+# Runtime database and local logs
+backend/wallet.db
+backend/wallet.db-shm
+backend/wallet.db-wal
+*.log
+
+# Next.js build output and local dependencies
+frontend/.next/
+frontend/node_modules/
+frontend/out/
+frontend/tsconfig.tsbuildinfo
+
+# Local operating-system/editor files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Local model/cache data
+*.gguf
+*.safetensors
+.cache/

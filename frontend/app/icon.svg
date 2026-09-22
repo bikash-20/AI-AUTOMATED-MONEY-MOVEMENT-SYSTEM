@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">Wallet</title>
+  <desc id="desc">A warm peach wallet mark on a plum background</desc>
+  <defs>
+    <linearGradient id="bg" x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6b5570"/>
+      <stop offset="1" stop-color="#2d2330"/>
+    </linearGradient>
+    <linearGradient id="card" x1="17" y1="19" x2="49" y2="48" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f7cdb6"/>
+      <stop offset="1" stop-color="#e89271"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="17" fill="url(#bg)"/>
+  <path d="M17 22.5a5.5 5.5 0 0 1 5.5-5.5h20A4.5 4.5 0 0 1 47 21.5V24h2a4 4 0 0 1 4 4v14a5 5 0 0 1-5 5H22a5 5 0 0 1-5-5V22.5Z" fill="url(#card)"/>
+  <path d="M17 24h30v8H17v-8Z" fill="#f2e9e4" fill-opacity=".2"/>
+  <path d="M39 31h10a4 4 0 0 1 4 4v3H39a3.5 3.5 0 1 1 0-7Z" fill="#2d2330" fill-opacity=".88"/>
+  <circle cx="43" cy="34.5" r="1.5" fill="#f7cdb6"/>
+</svg>
