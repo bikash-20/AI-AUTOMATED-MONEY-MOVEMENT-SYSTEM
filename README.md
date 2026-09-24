@@ -200,7 +200,7 @@ Copy `backend/.env.example` to `backend/.env`.
 | `OPENROUTER_MODELS` | free model list | Cloud fallback models |
 | `DB_PATH` | `./wallet.db` | SQLite database path |
 | `PENDING_TTL_SECONDS` | `60` | Review expiry window |
-| `TTS_ENGINE` | `edge` | `edge`, `qwen`, or `off` |
+| `TTS_ENGINE` | `qwen` | `edge`, `qwen`, or `off` |
 | `STT_MODEL` | `base` | Faster Whisper model |
 | `STT_COMPUTE` | `int8` | Faster Whisper compute mode |
 

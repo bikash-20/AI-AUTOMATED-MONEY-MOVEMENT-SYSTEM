@@ -44,7 +44,7 @@ export function SettingsModal({
   const [orUrl, setOrUrl] = useState("");
   const [orModels, setOrModels] = useState("");
   const [orKey, setOrKey] = useState("");
-  const [ttsEngine, setTtsEngine] = useState("edge");
+  const [ttsEngine, setTtsEngine] = useState("qwen");
   const [edgeVoice, setEdgeVoice] = useState("");
   const [qwenVoice, setQwenVoice] = useState("");
   const [sttModel, setSttModel] = useState("base");
@@ -111,6 +111,7 @@ export function SettingsModal({
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-bold text-cream">Settings</h2>
           <button
+            type="button"
             onClick={onClose}
             className="text-cream/70 hover:text-cream text-xl leading-none"
             title="Close"
@@ -201,7 +202,7 @@ export function SettingsModal({
               label="TTS engine"
               value={ttsEngine}
               onChange={setTtsEngine}
-              options={["edge", "qwen3"]}
+              options={["qwen", "edge"]}
             />
             <Field
               label="Edge TTS voice"
@@ -225,12 +226,14 @@ export function SettingsModal({
 
           <div className="flex items-center justify-end gap-2 pt-2">
             <button
+              type="button"
               onClick={onClose}
               className="btn-ghost rounded-full px-4 py-2 text-sm"
             >
               Close
             </button>
             <button
+              type="button"
               onClick={save}
               disabled={saving}
               className="btn-peach rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50"

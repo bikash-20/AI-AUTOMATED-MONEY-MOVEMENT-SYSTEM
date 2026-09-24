@@ -49,7 +49,7 @@ export function SavingsGoals({ userId }: { userId: number }) {
           {FESTIVALS.map((item) => <option key={item}>{item}</option>)}
         </select>
         <input type="number" min="1" value={target} onChange={(e) => setTarget(e.target.value)} placeholder="Target ৳" className="field-input w-32" />
-        <button onClick={createGoal} disabled={!target || busy} className="btn-peach rounded-lg px-4 py-2 text-sm disabled:opacity-40">Create</button>
+        <button type="button" onClick={createGoal} disabled={!target || busy} className="btn-peach rounded-lg px-4 py-2 text-sm disabled:opacity-40">Create</button>
       </div>
       {error ? <p className="text-xs text-red-200 mb-3">{error}</p> : null}
       {goals.length ? <div className="grid gap-2 sm:grid-cols-2">{goals.map((goal) => {
@@ -57,7 +57,7 @@ export function SavingsGoals({ userId }: { userId: number }) {
         return <div key={goal.id} className="rounded-xl bg-white/5 border border-white/10 p-3">
           <div className="flex justify-between text-sm"><span className="text-cream">{goal.festival}</span><span className="text-peach-500">{Math.round(progress)}%</span></div>
           <div className="h-1.5 rounded-full bg-white/10 mt-2 overflow-hidden"><div className="h-full bg-peach-500 rounded-full" style={{ width: `${progress}%` }} /></div>
-          <div className="flex items-center justify-between mt-2 text-xs text-secondary"><span>৳{Number(goal.saved_amount_bdt).toLocaleString("en-IN")} / ৳{Number(goal.target_amount_bdt).toLocaleString("en-IN")}</span><button onClick={() => contribute(goal)} disabled={busy} className="text-peach-500 hover:text-cream">Add money</button></div>
+          <div className="flex items-center justify-between mt-2 text-xs text-secondary"><span>৳{Number(goal.saved_amount_bdt).toLocaleString("en-IN")} / ৳{Number(goal.target_amount_bdt).toLocaleString("en-IN")}</span><button type="button" onClick={() => contribute(goal)} disabled={busy} className="text-peach-500 hover:text-cream">Add money</button></div>
         </div>;
       })}</div> : <p className="text-sm text-secondary">No savings goals yet.</p>}
     </section>

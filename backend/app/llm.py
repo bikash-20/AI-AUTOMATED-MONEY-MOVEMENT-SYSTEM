@@ -172,6 +172,15 @@ def parse_intent(
     Falls through to a regex-based parser when the LLM cascade returns
     nothing — so the demo stays alive even if every LLM slot is down.
     """
+    # Fast path: if the regex fallback can classify this with high
+    # confidence (greeting / thanks / bye / balance / history / pay_bill
+    # with a known biller, or send/request/split with a known handle),
+    # skip the 10s LLM round-trip entirely. This is what makes voice
+    # replies feel instant for the common case.
+    quick = _regex_intent(text, known_handles, known_billers)
+    if _is_high_confidence_intent(quick, known_handles, known_billers):
+        return quick
+
     user = (
         f"User said: {text!r}\n\n"
         f"Known handles (recipient names): {known_handles}\n"
@@ -183,17 +192,55 @@ def parse_intent(
         parsed = _parse_json_lenient(raw)
         if parsed.get("action") not in (None, "unknown"):
             return parsed
-    # LLM gave us nothing usable — try regex fallback.
-    return _regex_intent(text, known_handles, known_billers)
+    # LLM gave us nothing usable — return the regex answer we already
+    # computed above so we don't throw away good work.
+    return quick
+
+
+def _is_high_confidence_intent(
+    intent: dict, known_handles: list[str], known_billers: list[str]
+) -> bool:
+    """Whether the regex result is good enough to skip the LLM.
+
+    Confidence is high when the regex identified a real money action with
+    a known counterparty (handle or biller), or a clear small-talk
+    intent. Anything ambiguous goes to the LLM.
+    """
+    action = (intent.get("action") or "").strip().lower()
+    if action in {"greeting", "thanks", "bye", "balance", "history"}:
+        return True
+    if action == "send" or action == "request":
+        recipient = (intent.get("recipient") or "").strip()
+        amount = intent.get("amount")
+        if recipient and amount:
+            # Must be a real known handle, not a fuzzy guess.
+            return recipient in known_handles
+        return False
+    if action == "split":
+        recipients = intent.get("split_recipients") or []
+        amount = intent.get("amount")
+        if recipients and amount:
+            return all(r in known_handles for r in recipients)
+        return False
+    if action == "pay_bill":
+        biller = (intent.get("biller") or "").strip()
+        amount = intent.get("amount")
+        if biller and amount:
+            return biller in known_billers
+        return False
+    return False
 
 
 # ---- Regex fallback ---------------------------------------------------------
 _BANGLA_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
 
-# Match common money patterns: 500, 500 taka, ৳500, 1,200, 1k, 2.5k
+# Match common money patterns: 500, 500 taka, ৳500, 1,200, 1k, 2.5k.
+# Also handles STT noise: "500 takh" (missing a), "500 taq" (q→k),
+# "500 takaa", "500 টাকা" (Bangla).
 _AMOUNT_RE = re.compile(
     r"(?P<sym>৳|bdt|tk)?\s*"
-    r"(?P<num>\d[\d,]*(?:\.\d+)?|\d+(?:\.\d+)?\s*[kK]?)",
+    r"(?P<num>\d[\d,]*(?:\.\d+)?|\d+(?:\.\d+)?\s*[kK]?)"
+    r"(?:\s*(?:taka|takaa|takah|takh|tak|takaa|taqa|tks|টাকা|টা))?",
     re.IGNORECASE,
 )
 
@@ -275,11 +322,40 @@ def _extract_amount(text: str) -> Optional[float]:
 
 
 def _extract_recipient(text: str, known: list[str]) -> Optional[str]:
-    """Find a known handle in the text. Tries longest-first."""
+    """Find a known handle in the text. Tries longest-first.
+
+    Robust against STT noise: strips common fillers ("u", "ur", "the", "কে")
+    that STT often inserts around names, and prefers the handle that
+    follows a recipient preposition ("to", "for", "কে", "এ").
+    """
     t = _normalize(text)
     candidates = sorted(known, key=len, reverse=True)
+
+    # 1. Preposition-priority: handle directly after a recipient preposition.
+    prep_re = re.compile(
+        r"\b(?:to|for|towards|toward|with|by|কে|এ|টা)\s+(?:a\s+|an\s+|the\s+|ur\s+|u\s+)?"
+        r"(?P<h>[a-z]+)",
+        re.IGNORECASE,
+    )
+    for m in prep_re.finditer(t):
+        # Try progressively shorter suffixes (handle might be "rishad"
+        # but STT appended "x").
+        word = m.group("h")
+        # Direct hit.
+        if word in known:
+            return word
+        # Substring match (handle is prefix/suffix of word).
+        for h in candidates:
+            if h in word or word in h:
+                return h
+
+    # 2. Substring match anywhere.
     for h in candidates:
         if re.search(rf"\b{re.escape(h)}\b", t):
+            return h
+    # 3. Fuzzy: handle inside a word (STT might have glued it).
+    for h in candidates:
+        if h in t:
             return h
     return None
 
@@ -306,6 +382,15 @@ def _classify_action(text: str) -> str:
     if any(k in t for k in _BILL_TRIGGERS):
         return "pay_bill"
     if any(k in t for k in _SEND_TRIGGERS):
+        return "send"
+    # STT-friendly fallback: "<amount> to <handle>" with no verb. If we can
+    # see a number AND a recipient preposition, default to send rather than
+    # letting it fall to "unknown".
+    has_number = bool(re.search(r"\d", t))
+    has_prep = bool(re.search(
+        r"\b(to|for|towards|কে|এ)\b", t
+    ))
+    if has_number and has_prep:
         return "send"
     return "unknown"
 
@@ -389,10 +474,17 @@ def _parse_json_lenient(raw: str) -> dict:
 def phrase(text_kind: str, facts: dict) -> str:
     """Turn deterministic facts into a single natural sentence.
 
-    Financial facts never go through the LLM: even a well-prompted model can
-    round, omit, or invent a value. Casual text can still use the cascade.
+    Financial facts NEVER go through the LLM — every factual kind in
+    `_FACTUAL_PHRASE_KINDS` is short-circuited to the deterministic
+    template. This keeps replies instant (no Ollama round-trip) and
+    guarantees the model cannot fabricate a number that isn't in `facts`.
+
+    The non-factual path is for casual small talk only; even there we
+    cap latency by using the existing cascade (10s timeout) and falling
+    back to a deterministic template if it returns empty.
     """
     if text_kind in _FACTUAL_PHRASE_KINDS:
+        # Fast path: no LLM. This is what makes voice replies feel instant.
         return _deterministic_phrase(text_kind, facts)
     system = config.PHRASER_SYSTEM_PROMPT
     user = json.dumps({"kind": text_kind, **facts})
@@ -412,7 +504,14 @@ def chat_reply(text: str, user_handle: str) -> str:
 
     Uses the LLM cascade if available; falls back to deterministic templates
     so the system always replies.
+
+    Fast path: for clear greetings / thanks / bye, skip the LLM entirely
+    (no 10s round-trip). The LLM is reserved for ambiguous small talk.
     """
+    norm = _normalize(text)
+    if _classify_action(norm) in {"greeting", "thanks", "bye"}:
+        return _deterministic_chat(text, user_handle)
+
     system = (
         "You are Wallet Assistant — concise, friendly, BD-flavored. "
         "Address the user as 'Boss' when natural. Keep replies short (1-2 sentences). "
@@ -478,14 +577,17 @@ _BALANCE_HINTS = [
 
 def _deterministic_chat(text: str, user_handle: str) -> str:
     t = _normalize(text)
+    # Check thanks/bye/greetings BEFORE "how are you" / greetings because some
+    # greeting tokens (e.g. "yo") are substrings of longer phrases ("thank you",
+    # "goodbye"). Order matters: thanks/bye first, then greetings.
+    if any(k in t for k in _THANKS):
+        return _THANKS_REPLIES[0]
+    if any(k in t for k in _BYE):
+        return _BYE_REPLIES[0]
     if any(k in t for k in ("how are you", "how's it going", "how is it going", "what's up")):
         return "Doing well, Boss. I'm ready whenever you are."
     if any(g in t for g in _GREETINGS):
         return _GREETING_REPLIES[0]
-    if any(g in t for g in _THANKS):
-        return _THANKS_REPLIES[0]
-    if any(g in t for g in _BYE):
-        return _BYE_REPLIES[0]
     if any(k in t for k in ("who are you", "what are you", "your name", "তুমি কে")):
         return (
             "I'm Wallet Assistant — a local demo that moves money between "

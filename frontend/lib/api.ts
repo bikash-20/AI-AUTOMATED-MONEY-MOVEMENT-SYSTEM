@@ -77,6 +77,32 @@ export type HistoryResponse = {
 
 const BASE = "/api";
 
+/**
+ * Synthesize speech through the configured backend TTS engine.
+ *
+ * Returns the raw WAV bytes as a Blob. Throws on non-2xx — the frontend
+ * must NOT fall back to a browser-default voice if the backend engine
+ * fails, because that's exactly the bug we're fixing.
+ */
+export async function speak(text: string): Promise<Blob> {
+  const r = await fetch(`${BASE}/voice/speak`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!r.ok) {
+    let detail = `${r.status} ${r.statusText}`;
+    try {
+      const j = await r.json();
+      if (j?.detail) detail += `: ${JSON.stringify(j.detail)}`;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(`speak ${detail}`);
+  }
+  return r.blob();
+}
+
 async function httpJson<T>(
   method: string,
   path: string,
@@ -126,6 +152,13 @@ export const api = {
     ),
   agentAct: (body: { user_id: number; text: string; idempotency_key: string }) =>
     httpJson<AgentActResponse>("POST", "/agent/act", body),
+  agentActSplit: (body: {
+    user_id: number;
+    recipient_handles: string[];
+    amount_bdt: string;
+    note?: string;
+    idempotency_key: string;
+  }) => httpJson<AgentActResponse>("POST", "/agent/act-split", body),
   agentConfirm: (body: {
     user_id: number;
     pending_id: number;
@@ -134,10 +167,10 @@ export const api = {
   }) => httpJson<AgentConfirmResponse>("POST", "/agent/confirm", body),
   agentChat: (body: { user_id: number; text: string }) =>
     httpJson<{ text: string; action: string }>("POST", "/agent/chat", body),
-  payRequest: (requestId: number, idempotencyKey: string) =>
+  payRequest: (requestId: number, idempotencyKey: string, userId: number) =>
     httpJson<{ success: boolean; new_balance_bdt: string }>(
       "POST",
-      `/requests/${requestId}/pay?idempotency_key=${encodeURIComponent(idempotencyKey)}`
+      `/requests/${requestId}/pay?idempotency_key=${encodeURIComponent(idempotencyKey)}&user_id=${userId}`
     ),
   declineRequest: (requestId: number) =>
     httpJson<{ success: boolean }>("POST", `/requests/${requestId}/decline`),

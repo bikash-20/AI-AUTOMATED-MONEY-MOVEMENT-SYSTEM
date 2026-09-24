@@ -43,6 +43,7 @@ export function PendingRequests({
             </div>
             <div className="flex gap-1.5 shrink-0">
               <button
+                type="button"
                 onClick={() => onPay(r.id)}
                 disabled={isPending}
                 className="btn-peach rounded-md px-3 py-1.5 text-sm disabled:opacity-40"
@@ -50,6 +51,7 @@ export function PendingRequests({
                 Pay
               </button>
               <button
+                type="button"
                 onClick={() => onDecline(r.id)}
                 disabled={isPending}
                 className="btn-ghost rounded-md px-3 py-1.5 text-sm disabled:opacity-40"

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
 import { AgentActResponse, HistoryResponse, PendingRequest, User, api } from "@/lib/api";
@@ -18,7 +18,7 @@ import { SplitForm } from "@/components/SplitForm";
 import { SavingsGoals } from "@/components/SavingsGoals";
 import { AnimatePresence, motion } from "framer-motion";
 import { HandCoins, LogOut, Settings } from "lucide-react";
-import { speakText } from "@/lib/speech";
+import { speakText, subscribeSpeaking } from "@/lib/speech";
 
 const BalanceChart = dynamic(
   () => import("@/components/BalanceChart").then((module) => module.BalanceChart),
@@ -44,12 +44,17 @@ export default function DashboardPage() {
   const [working, setWorking] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [voiceConfirmListening, setVoiceConfirmListening] = useState(false);
   const [askOpen, setAskOpen] = useState(false);
   const [askRecipient, setAskRecipient] = useState("");
   const [askAmount, setAskAmount] = useState("");
   const [askNote, setAskNote] = useState("");
   const [splitOpen, setSplitOpen] = useState(false);
+
+  // Bot speaking flag — used to disable the mic so the bot's own audio
+  // isn't picked up as a new user command. Source of truth lives in
+  // lib/speech.ts; we mirror it locally for JSX.
+  const [speaking, setSpeaking] = useState(false);
+  useEffect(() => subscribeSpeaking(setSpeaking), []);
 
   // Auth gate: redirect to /login if no session.
   useEffect(() => {
@@ -110,6 +115,15 @@ export default function DashboardPage() {
     [users, activeId]
   );
 
+  // Helper: speak `text`, surfacing backend TTS failures as a toast.
+  // We do NOT silently fall back to a browser-default voice — that was
+  // the original bug.
+  const safeSpeak = useCallback((text: string) => {
+    speakText(text, {
+      onError: (err) => setToast(`Voice reply failed: ${err.message}`),
+    });
+  }, []);
+
   // ---- Send (manual form) -----------------------------------------------
   async function handleSend({
     recipient,
@@ -135,18 +149,18 @@ export default function DashboardPage() {
       const resp = await api.agentAct({ user_id: activeId, text, idempotency_key: key });
       if (resp.card && resp.pending_id) {
         setReviewResp(resp);
-        // Once a review card is up, the next voice command is interpreted
-        // as confirm/decline instead of a new intent.
-        setVoiceConfirmListening(true);
+        // No auto-engagement of the mic. The review card carries its
+        // own inline mic button that the user taps if they want to
+        // confirm by voice.
       } else {
         setToast(resp.text);
-        await refresh();
+        safeSpeak(resp.text);
       }
       return resp;
     } catch (e) {
       const message = `Error: ${(e as Error).message}`;
       setToast(message);
-      speakText("I could not complete that request.");
+      safeSpeak("I could not complete that request.");
       return null;
     } finally {
       setWorking(false);
@@ -156,7 +170,6 @@ export default function DashboardPage() {
   async function handleConfirm() {
     if (!reviewResp || !reviewResp.pending_id || !activeId || !pendingKey) return;
     setWorking(true);
-    setVoiceConfirmListening(false);
     try {
       const r = await api.agentConfirm({
         user_id: activeId,
@@ -167,11 +180,11 @@ export default function DashboardPage() {
       setReviewResp(null);
       setPendingKey(null);
       setToast(r.text);
-        speakText(r.text);
+      safeSpeak(r.text);
       await refresh();
     } catch (e) {
       setToast(`Confirm failed: ${(e as Error).message}`);
-        speakText("I could not confirm that transfer.");
+      safeSpeak("I could not confirm that transfer.");
     } finally {
       setWorking(false);
     }
@@ -180,7 +193,6 @@ export default function DashboardPage() {
   async function handleDecline() {
     if (!reviewResp || !reviewResp.pending_id || !activeId || !pendingKey) return;
     setWorking(true);
-    setVoiceConfirmListening(false);
     try {
       const r = await api.agentConfirm({
         user_id: activeId,
@@ -191,37 +203,42 @@ export default function DashboardPage() {
       setReviewResp(null);
       setPendingKey(null);
       setToast(r.text);
-        speakText(r.text);
+      safeSpeak(r.text);
       await refresh();
     } catch (e) {
       setToast(`Cancel failed: ${(e as Error).message}`);
-        speakText("I could not cancel that transfer.");
+      safeSpeak("I could not cancel that transfer.");
     } finally {
       setWorking(false);
     }
   }
 
-  // Voice transcript handler — interprets as confirm/decline when a review
-  // card is up, otherwise as a normal intent.
+  // Voice transcript handler. Routes transcripts based on context:
+  //   - If a review card is up → strict yes/no dispatch (anything else
+  //     silently ignored — protects against bot-tail audio, ambient
+  //     chatter, accidental taps).
+  //   - Otherwise → run as a new intent through sendIntent.
   async function onVoiceTranscript(t: string) {
-    if (!reviewResp) {
-      setToast(`Heard: "${t}"`);
-      const response = await sendIntent(t);
-      if (response?.text) speakText(response.text);
-      return;
-    }
     const norm = t.toLowerCase().trim();
     const affirmative = /\b(yes|yeah|yep|sure|ok|okay|confirm|do it|haan|জি|কর|করো|হ্যাঁ)\b/.test(norm);
     const negative = /\b(no|nope|cancel|stop|nah|না|বাদ|না কর)\b/.test(norm);
-    if (affirmative) {
-      await handleConfirm();
-    } else if (negative) {
-      await handleDecline();
-    } else {
-      const response = `Say "yes" to confirm or "no" to cancel. I heard: ${t}`;
-      setToast(response);
-      speakText(response);
+
+    if (reviewResp) {
+      if (affirmative) {
+        await handleConfirm();
+        return;
+      }
+      if (negative) {
+        await handleDecline();
+        return;
+      }
+      // Strict yes/no — silently drop anything else while a card is up.
+      return;
     }
+
+    setToast(`Heard: "${t}"`);
+    const response = await sendIntent(t);
+    if (response?.text) safeSpeak(response.text);
   }
 
   // ---- Pay a request ----------------------------------------------------
@@ -229,7 +246,7 @@ export default function DashboardPage() {
     if (!activeId) return;
     setWorking(true);
     try {
-      const r = await api.payRequest(id, newIdempotencyKey());
+      const r = await api.payRequest(id, newIdempotencyKey(), activeId);
       setToast(`Paid. New balance: ৳${Number(r.new_balance_bdt).toLocaleString("en-IN")}`);
       await refresh();
     } catch (e) {
@@ -265,8 +282,39 @@ export default function DashboardPage() {
   }
 
   async function handleSplit({ recipients, amount }: { recipients: string[]; amount: string }) {
+    if (!activeId) return;
+    if (recipients.length < 2) {
+      setToast("Pick at least two people.");
+      return;
+    }
     setSplitOpen(false);
-    await sendIntent(`split ${amount} between ${recipients.join(" ")}`);
+    setWorking(true);
+    setReviewResp(null);
+    try {
+      const key = newIdempotencyKey();
+      setPendingKey(key);
+      // N-way split goes through the explicit endpoint — no LLM
+      // round-trip, no regex parser racing with chip-array input. Voice
+      // and text splits still flow through sendIntent / /agent/act.
+      const resp = await api.agentActSplit({
+        user_id: activeId,
+        recipient_handles: recipients,
+        amount_bdt: amount,
+        idempotency_key: key,
+      });
+      if (resp.card && resp.pending_id) {
+        setReviewResp(resp);
+      } else {
+        setToast(resp.text);
+        safeSpeak(resp.text);
+      }
+    } catch (e) {
+      const message = `Error: ${(e as Error).message}`;
+      setToast(message);
+      safeSpeak("I could not complete that split.");
+    } finally {
+      setWorking(false);
+    }
   }
 
   if (!authChecked || !activeUser || activeId === null) {
@@ -281,6 +329,10 @@ export default function DashboardPage() {
     clearActiveUserId();
     router.push("/login");
   }
+
+  // Header mic is disabled while the bot is talking OR while the agent
+  // is busy. The mic button only ever arms via an explicit user tap.
+  const headerMicDisabled = working || speaking;
 
   return (
     <motion.div
@@ -310,6 +362,7 @@ export default function DashboardPage() {
         <SessionSwitcher users={users} currentId={activeId} onChange={setActiveId} />
         <div className="flex items-center gap-2">
           <button
+            type="button"
             onClick={() => setAskOpen(true)}
             title="Ask someone for money"
             className="btn-ghost rounded-full px-3.5 py-2 flex items-center gap-2 text-sm font-medium"
@@ -318,6 +371,7 @@ export default function DashboardPage() {
             <span>Request money</span>
           </button>
           <button
+            type="button"
             onClick={() => setSettingsOpen(true)}
             title="Settings"
             className="btn-ghost rounded-full w-10 h-10 flex items-center justify-center text-sm"
@@ -325,10 +379,11 @@ export default function DashboardPage() {
             <Settings size={17} strokeWidth={1.8} />
           </button>
           <VoiceButton
-            disabled={working}
+            disabled={headerMicDisabled}
             onTranscript={onVoiceTranscript}
           />
           <button
+            type="button"
             onClick={handleLogout}
             title="Sign out"
             className="btn-ghost rounded-full w-10 h-10 flex items-center justify-center text-sm"
@@ -359,7 +414,7 @@ export default function DashboardPage() {
             pending={working && !reviewResp}
             disabled={!!reviewResp}
           />
-          <button onClick={() => setSplitOpen(true)} disabled={working || !!reviewResp} className="btn-ghost rounded-lg px-4 py-2.5 mt-3 w-full text-sm disabled:opacity-40">
+          <button type="button" onClick={() => setSplitOpen(true)} disabled={working || !!reviewResp} className="btn-ghost rounded-lg px-4 py-2.5 mt-3 w-full text-sm disabled:opacity-40">
             Split money with two people
           </button>
         </div>
@@ -391,7 +446,6 @@ export default function DashboardPage() {
               onConfirm={handleConfirm}
               onDecline={handleDecline}
               pending={working}
-              voiceListening={voiceConfirmListening && !working}
             />
           </motion.div>
         ) : null}
@@ -409,7 +463,7 @@ export default function DashboardPage() {
           disabled={working}
           placeholder={
             reviewResp
-              ? 'Say "yes" to confirm or "no" to cancel'
+              ? 'Tap a button on the card above to confirm or cancel'
               : "Send, request, split, pay bill, balance, or just chat…"
           }
         />
@@ -429,17 +483,27 @@ export default function DashboardPage() {
         variants={{ hidden: { opacity: 0, y: 16 }, visible: { opacity: 1, y: 0 } }}
         transition={{ duration: 0.5, ease: "easeOut" }}
       >
-        <div className="lg:col-span-2 glass rounded-2xl p-6">
-          <div className="text-secondary text-sm font-medium uppercase tracking-wider mb-4">
+        {/* Recent — fixed ceiling with internal scroll. The card grows up
+            to a max height, then its body scrolls. Header stays pinned so
+            the section title doesn't move. */}
+        <div className="lg:col-span-2 glass rounded-2xl p-6 flex flex-col min-h-0 max-h-[480px]">
+          <div className="text-secondary text-sm font-medium uppercase tracking-wider mb-4 shrink-0">
             Recent
           </div>
-          <HistoryList txns={history?.txns ?? []} />
+          <div className="flex-1 min-h-0 overflow-y-auto -mr-2 pr-2">
+            <HistoryList txns={history?.txns ?? []} />
+          </div>
         </div>
-        <div className="glass rounded-2xl p-6">
-          <div className="text-secondary text-sm font-medium uppercase tracking-wider mb-4">
+        {/* Balance chart card — mirrors the same fixed ceiling so the
+            history card and the chart card stay the same height as the
+            activity list grows. */}
+        <div className="glass rounded-2xl p-6 flex flex-col min-h-0 max-h-[480px]">
+          <div className="text-secondary text-sm font-medium uppercase tracking-wider mb-4 shrink-0">
             Balance · 14 days
           </div>
-          <BalanceChart data={history?.timeline ?? []} />
+          <div className="flex-1 min-h-0 overflow-y-auto -mr-2 pr-2">
+            <BalanceChart data={history?.timeline ?? []} />
+          </div>
         </div>
       </motion.div>
 
@@ -479,6 +543,7 @@ export default function DashboardPage() {
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-bold text-cream">Ask for money</h2>
               <button
+                type="button"
                 onClick={() => setAskOpen(false)}
                 className="text-cream/70 hover:text-cream text-xl leading-none"
               >
@@ -525,12 +590,14 @@ export default function DashboardPage() {
               </label>
               <div className="flex justify-end gap-2 pt-2">
                 <button
+                  type="button"
                   onClick={() => setAskOpen(false)}
                   className="btn-ghost rounded-full px-4 py-2 text-sm"
                 >
                   Cancel
                 </button>
                 <button
+                  type="button"
                   onClick={handleAsk}
                   disabled={!askRecipient || !askAmount || working}
                   className="btn-peach rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-40"
@@ -549,13 +616,25 @@ export default function DashboardPage() {
           <motion.div className="fixed inset-0 z-40 flex items-center justify-center p-4" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
             <div className="absolute inset-0 bg-plum-950/60 backdrop-blur-sm" onClick={() => setSplitOpen(false)} />
             <motion.div className="relative w-full max-w-md glass-strong rounded-2xl p-6" initial={{ opacity: 0, scale: 0.96, y: 12 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.96, y: 12 }}>
-              <div className="flex items-center justify-between mb-4"><h2 className="text-lg font-bold text-cream">Split money</h2><button onClick={() => setSplitOpen(false)} className="text-cream/70 text-xl">×</button></div>
+              <div className="flex items-center justify-between mb-4"><h2 className="text-lg font-bold text-cream">Split money</h2><button type="button" onClick={() => setSplitOpen(false)} className="text-cream/70 text-xl">×</button></div>
               <p className="text-sm text-secondary mb-4">Choose two people. The total is divided equally and confirmed once.</p>
               <SplitForm recipients={recipientHandles} onSubmit={handleSplit} disabled={working} />
             </motion.div>
           </motion.div>
         ) : null}
       </AnimatePresence>
+
+      <footer className="pt-8 pb-2 text-center text-xs text-secondary">
+        Developed by{" "}
+        <a
+          href="https://github.com/bikash-20"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-peach-500 hover:text-peach-300 transition-colors"
+        >
+          Bikash Talukder
+        </a>
+      </footer>
     </motion.div>
   );
 }

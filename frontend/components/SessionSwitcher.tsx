@@ -19,6 +19,7 @@ export function SessionSwitcher({
   return (
     <div className="relative">
       <button
+        type="button"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
         aria-haspopup="menu"
@@ -35,6 +36,7 @@ export function SessionSwitcher({
           </div>
           {users.map((u) => (
             <button
+              type="button"
               key={u.id}
               onClick={() => {
                 onChange(u.id);

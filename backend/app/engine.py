@@ -30,10 +30,41 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import config
-from .models import Account, Biller, Request, RequestStatus, Split, Transaction, TxnStatus, User
+from .models import Account, Biller, Request, RequestStatus, Split, Transaction, TxnKind, TxnStatus, User
 
 
 # ---- Errors -----------------------------------------------------------------
+# Cap on N-way split recipients. Keeps the UI sane (chip-array fits in a
+# modal) and prevents runaway Transaction fanout from a single pending split.
+_MAX_SPLIT_RECIPIENTS = 8
+
+
+def _publish_categorize(txn_id: int) -> None:
+    """Best-effort fan-out of a categorize.requested event after a confirm.
+
+    The categoriser is a background concern — if the EventBus is missing
+    (tests), the loop is not running, or the publish itself fails, we
+    MUST NOT raise into the engine. The txn is already committed; the
+    user has already been told it succeeded.
+    """
+    try:
+        import asyncio
+
+        from .services.event_bus import get_bus
+
+        bus = get_bus()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None or not loop.is_running():
+            return  # no live event loop — categoriser will catch up via DB
+        loop.create_task(bus.publish("categorize.requested", {"txn_id": txn_id}))
+    except Exception:
+        # Categoriser must NEVER crash the engine.
+        pass
+
+
 class EngineError(Exception):
     code = "engine_error"
 
@@ -203,6 +234,11 @@ def create_pending_split(
     """Equal split. Per-recipient = total / N (rounded to paisa)."""
     if len(recipient_handles) < 2:
         raise EngineError("split needs at least 2 recipients")
+    if len(recipient_handles) > _MAX_SPLIT_RECIPIENTS:
+        raise EngineError(
+            f"split supports at most {_MAX_SPLIT_RECIPIENTS} recipients "
+            f"(got {len(recipient_handles)})"
+        )
     # Resolve all recipients first so we fail fast with a clear error.
     recipients = []
     for h in recipient_handles:
@@ -217,10 +253,15 @@ def create_pending_split(
     per = (total_amount / Decimal(len(recipients))).quantize(Decimal("0.01"))
     # Round-off accounting: push remainder to first recipient.
     diff = total_amount - per * len(recipients)
+    # Balance check BEFORE writing any rows so we never create an orphaned
+    # Split record when the initiator can't cover the amount.
+    init_acct = (
+        session.query(Account).filter_by(user_id=initiator_user_id).one()
+    )
+    if init_acct.balance_bdt < total_amount:
+        raise InsufficientFunds(init_acct.balance_bdt, total_amount)
     sp = Split(
-        initiator_account_id=_get_account(
-            session, _get_user(session, initiator_user_id)
-        ).id,
+        initiator_account_id=init_acct.id,
         total_amount_bdt=total_amount,
         per_amount_bdt=per,
         recipients_json=json.dumps([u.id for u in recipients]),
@@ -228,13 +269,6 @@ def create_pending_split(
     )
     session.add(sp)
     session.flush()
-    # Initial balance check on the initiator — if they can't cover the total,
-    # we fail before any child rows.
-    init_acct = (
-        session.query(Account).filter_by(user_id=initiator_user_id).one()
-    )
-    if init_acct.balance_bdt < total_amount:
-        raise InsufficientFunds(init_acct.balance_bdt, total_amount)
     # Create pending child transactions tied to the split.
     first = True
     for u in recipients:
@@ -406,6 +440,12 @@ def confirm_split(session: Session, *, user_id: int, pending_id: int) -> Transac
 
 
 def decline(session: Session, *, user_id: int, pending_id: int) -> Transaction:
+    """Cancel a single pending transaction or all children of a split.
+
+    No cross-call to decline_split: we detect parent_split_id here and
+    delegate directly to avoid the mutual recursion that caused stack
+    overflows in the original code.
+    """
     txn = session.get(Transaction, pending_id)
     if txn is None:
         raise UnknownPending(f"pending_id={pending_id}")
@@ -414,18 +454,44 @@ def decline(session: Session, *, user_id: int, pending_id: int) -> Transaction:
     if txn.status != TxnStatus.PENDING.value:
         raise PendingAlreadyResolved(f"status={txn.status}")
     if txn.parent_split_id is not None:
-        return decline_split(session, user_id=user_id, pending_id=pending_id)
+        # Inline the split-cancellation logic here instead of calling
+        # decline_split() to prevent mutual recursion.
+        children = (
+            session.query(Transaction)
+            .filter_by(parent_split_id=txn.parent_split_id)
+            .order_by(Transaction.id.asc())
+            .all()
+        )
+        for child in children:
+            if child.status == TxnStatus.PENDING.value:
+                child.status = TxnStatus.CANCELLED.value
+            elif child.status != TxnStatus.CANCELLED.value:
+                raise PendingAlreadyResolved(f"status={child.status}")
+        session.flush()
+        return txn
     txn.status = TxnStatus.CANCELLED.value
     session.flush()
     return txn
 
 
 def decline_split(session: Session, *, user_id: int, pending_id: int) -> Transaction:
+    """Cancel all pending children of a split transaction.
+
+    If `pending_id` turns out to not be a split child, cancels it as a plain
+    transaction. Does NOT call decline() to avoid mutual recursion.
+    """
     first = session.get(Transaction, pending_id)
-    if first is None or first.parent_split_id is None:
-        return decline(session, user_id=user_id, pending_id=pending_id)
+    if first is None:
+        raise UnknownPending(f"pending_id={pending_id}")
     if first.initiator_user_id != user_id:
         raise UnknownPending("not your split")
+    if first.parent_split_id is None:
+        # Not a split child — cancel it as a plain transaction inline.
+        if first.status != TxnStatus.PENDING.value:
+            raise PendingAlreadyResolved(f"status={first.status}")
+        first.status = TxnStatus.CANCELLED.value
+        session.flush()
+        return first
     children = (
         session.query(Transaction)
         .filter_by(parent_split_id=first.parent_split_id)
@@ -443,7 +509,7 @@ def decline_split(session: Session, *, user_id: int, pending_id: int) -> Transac
 
 def _execute(session: Session, txn: Transaction) -> None:
     """Apply a pending transaction. Must be called inside an open txn."""
-    if txn.kind in ("send", "split_child"):
+    if txn.kind in (TxnKind.SEND.value, TxnKind.SPLIT_CHILD.value):
         if txn.from_account_id is None or txn.to_account_id is None:
             raise EngineError("malformed txn: missing accounts")
         src = session.get(Account, txn.from_account_id)
@@ -456,18 +522,31 @@ def _execute(session: Session, txn: Transaction) -> None:
             raise InsufficientFunds(src.balance_bdt, txn.amount_bdt)
         src.balance_bdt = src.balance_bdt - txn.amount_bdt
         dst.balance_bdt = dst.balance_bdt + txn.amount_bdt
-    elif txn.kind == "bill":
+    elif txn.kind == TxnKind.BILL.value:
         src = session.get(Account, txn.from_account_id)
         if src is None:
             raise EngineError("account vanished mid-transaction")
         if src.balance_bdt < txn.amount_bdt:
             raise InsufficientFunds(src.balance_bdt, txn.amount_bdt)
         src.balance_bdt = src.balance_bdt - txn.amount_bdt
+    elif txn.kind == TxnKind.SAVINGS.value:
+        # Savings contributions bypass _execute() (balances updated inline in
+        # the accounts router). If _execute() is ever called on a savings txn
+        # it means it was incorrectly put into the pending flow — raise clearly
+        # rather than silently applying a double-debit.
+        raise EngineError(
+            f"savings transactions are not executed via confirm(); "
+            f"txn_id={txn.id} was never pending"
+        )
     else:
         raise EngineError(f"unknown kind: {txn.kind}")
     txn.status = TxnStatus.COMPLETED.value
     txn.completed_at = _utcnow()
     session.flush()
+    # Fan-out a categorize.requested event so the background worker can
+    # write a TxnTag row. Fire-and-forget — categoriser is not on the
+    # money-move critical path.
+    _publish_categorize(txn.id)
 
 
 # ---- Pay a request ---------------------------------------------------------
@@ -478,12 +557,25 @@ def pay_request(
     request_id: int,
     idempotency_key: str,
 ) -> Transaction:
-    """Payer honors a request. Creates a send transaction and links it."""
+    """Payer honors a request. Creates a send transaction and links it.
+
+    The transaction is created with status=COMPLETED and balances are updated
+    inline. It must NEVER be passed to confirm() — it was never pending.
+    Guard: if a linked transaction already exists we return it idempotently
+    rather than charging twice.
+    """
     req = session.get(Request, request_id)
     if req is None:
         raise EngineError(f"request_id={request_id}")
     if req.payer_user_id != payer_user_id:
         raise EngineError("not your request to pay")
+    if req.status == RequestStatus.PAID.value:
+        # Idempotent replay: return the already-created transaction.
+        if req.linked_txn_id is not None:
+            existing_txn = session.get(Transaction, req.linked_txn_id)
+            if existing_txn is not None:
+                return existing_txn
+        raise EngineError("request already paid")
     if req.status != RequestStatus.PENDING.value:
         raise EngineError(f"request status={req.status}")
     payer = _get_user(session, payer_user_id)
@@ -492,13 +584,19 @@ def pay_request(
     asker_acct = _get_account(session, asker)
     if payer_acct.balance_bdt < req.amount_bdt:
         raise InsufficientFunds(payer_acct.balance_bdt, req.amount_bdt)
+    # Check for an existing transaction with this idempotency key before
+    # creating a new one to prevent duplicate charges on retried requests.
+    full_key = f"reqpay:{idempotency_key}"
+    existing = _find_idempotent_txn(session, payer_user_id, full_key)
+    if existing is not None:
+        return existing
     txn = Transaction(
-        idempotency_key=f"reqpay:{idempotency_key}",
+        idempotency_key=full_key,
         initiator_user_id=payer_user_id,
         from_account_id=payer_acct.id,
         to_account_id=asker_acct.id,
         amount_bdt=req.amount_bdt,
-        kind="send",
+        kind=TxnKind.SEND.value,
         status=TxnStatus.COMPLETED.value,
         note=req.note,
         completed_at=_utcnow(),
@@ -511,6 +609,9 @@ def pay_request(
     req.linked_txn_id = txn.id
     req.resolved_at = _utcnow()
     session.flush()
+    # The pay_request path does NOT go through _execute (the txn was never
+    # pending), so we publish here explicitly for categorization.
+    _publish_categorize(txn.id)
     return txn
 
 

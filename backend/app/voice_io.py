@@ -1,13 +1,20 @@
-"""Voice I/O — TTS queue/worker (Qwen3 -> Edge fallback) + STT helper.
+"""Voice I/O — TTS synthesis (returns WAV bytes) + optional server-side playback
+queue + STT helper.
 
-Mirrors ~/python/AI ENGINEERING/voice.py:
-  - speak() puts jobs on a queue; worker thread drains it
-  - Qwen3-TTS via mlx-audio is the local, realistic voice
-  - Edge TTS is the lightweight online fallback (default for v1)
-  - afplay on macOS for non-blocking playback
+Two TTS consumers exist in this codebase:
+  - HTTP /voice/speak: returns WAV bytes to the browser via `synthesize()`.
+    This is the path the dashboard uses so the *configured* voice engine
+    (Qwen3, Edge, …) is what the user actually hears.
+  - `speak()` / `_speak_blocking()`: legacy server-side playback via a queue
+    and `afplay`/`aplay`. Kept for any caller that still wants audio on the
+    host (e.g. a future CLI / log-tailing tool). It is no longer wired to the
+    HTTP layer.
+
+Mirrors ~/python/AI ENGINEERING/voice.py for the queue/worker pattern.
 """
 from __future__ import annotations
 
+import io
 import os
 import queue
 import subprocess
@@ -37,19 +44,34 @@ def _model_dir() -> str:
 
 
 def _get_model():
-    """Lazy-init Qwen3-TTS. Thread-safe."""
+    """Lazy-init Qwen3-TTS. Thread-safe.
+
+    Surfaces load failures loudly so the dashboard can show the user a real
+    error rather than silently falling through to the browser's robotic
+    default voice (which is exactly the bug we just fixed).
+
+    On non-Apple-Silicon (Linux / Windows) mlx-audio is not installable.
+    We raise a clear RuntimeError so the TTS layer can fall back to
+    Edge TTS rather than crashing the process.
+    """
     global _model
     if _model is not None:
         return _model
     with _model_lock:
         if _model is not None:
             return _model
-        from mlx_audio.tts import load_model  # heavy import
+        try:
+            from mlx_audio.tts import load_model  # heavy import; Apple Silicon only
+        except ImportError as exc:
+            raise RuntimeError(
+                "mlx-audio is not available on this platform (requires Apple Silicon). "
+                "Set TTS_ENGINE=edge in your .env to use Edge TTS instead."
+            ) from exc
 
         path = _model_dir()
-        print(f"  [tts] loading Qwen3-TTS from {path}…")
+        print(f"  [tts] loading Qwen3-TTS from {path}…", flush=True)
         _model = load_model(path)
-        print(f"  [tts] ready (speaker={config.QWEN_TTS_VOICE})")
+        print(f"  [tts] ready (speaker={config.QWEN_TTS_VOICE})", flush=True)
         return _model
 
 
@@ -101,20 +123,32 @@ def _synthesize_to_wav(text: str, out_path: str) -> None:
         except RuntimeError as e:
             if "edge-tts is not installed" not in str(e):
                 raise
-            print("  [tts] Edge TTS unavailable; falling back to Qwen3.")
+            print("  [tts] Edge TTS unavailable; falling back to Qwen3.", flush=True)
             try:
                 _qwen_synthesize_to_wav(text, out_path)
                 return
-            except Exception:
+            except Exception as qe:
                 raise RuntimeError(
-                    "No TTS backend available."
+                    f"No TTS backend available. Edge missing, Qwen failed: {qe!r}"
                 ) from e
     if engine == "qwen":
-        _qwen_synthesize_to_wav(text, out_path)
-        return
+        try:
+            _qwen_synthesize_to_wav(text, out_path)
+            return
+        except RuntimeError as e:
+            if "mlx-audio is not available" in str(e):
+                print(
+                    "  [tts] Qwen3-TTS unavailable (non-Apple-Silicon); "
+                    "falling back to Edge TTS.",
+                    flush=True,
+                )
+                _edge_synthesize_to_wav(text, out_path)
+                return
+            raise
     if engine == "off":
         # No-op but still produce an empty wav so callers don't choke.
-        _save_wav(__import__("numpy").zeros((1,), dtype="float32"), 24000, out_path)
+        import numpy as np
+        _save_wav(np.zeros((1,), dtype="float32"), 24000, out_path)
         return
     raise ValueError(f"Unsupported TTS_ENGINE={engine!r}")
 
@@ -139,6 +173,56 @@ def _save_wav(audio, sample_rate: int, out_path: str) -> None:
     wavfile.write(out_path, int(sample_rate), pcm)
 
 
+# ---- Public: synthesize to bytes -------------------------------------------
+def synthesize(text: str) -> bytes:
+    """Run the configured TTS engine and return raw WAV bytes.
+
+    No side effects: no temp files left behind on disk (we render straight
+    to an in-memory buffer), no afplay, no queue. This is what the HTTP
+    /voice/speak endpoint returns so the *configured* voice engine reaches
+    the browser.
+
+    Raises RuntimeError on failure — callers should surface the error to
+    the user rather than silently falling back to a browser default voice.
+    """
+    clean = " ".join((text or "").split()).strip()
+    if not clean:
+        # Return a tiny valid silent WAV so the client doesn't error on empty.
+        return _silent_wav_bytes(duration_ms=10)
+    fd, path = tempfile.mkstemp(prefix="wallet_tts_", suffix=".wav")
+    try:
+        os.close(fd)
+        _synthesize_to_wav(clean, path)
+        with open(path, "rb") as f:
+            data = f.read()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if len(data) < 64:  # RIFF header alone is ~44 bytes
+        raise RuntimeError(
+            f"TTS engine {config.TTS_ENGINE!r} produced empty/invalid audio"
+        )
+    return data
+
+
+def _silent_wav_bytes(duration_ms: int = 10) -> bytes:
+    """Minimal valid WAV containing silence. Used for empty input."""
+    import numpy as np
+    from scipy.io import wavfile
+
+    sr = 24000
+    n_samples = max(1, int(sr * duration_ms / 1000))
+    audio = np.zeros(n_samples, dtype=np.float32)
+    buf = io.BytesIO()
+    wavfile.write(buf, sr, (audio * 32767.0).astype(np.int16))
+    return buf.getvalue()
+
+
+# ---- Legacy: server-side queue + afplay ------------------------------------
+# Kept intact for any non-HTTP caller. The HTTP /voice/speak path no longer
+# uses this — it returns audio bytes directly via synthesize() above.
 def _play_wav(path: str) -> None:
     try:
         subprocess.Popen(

@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from .. import engine
 from ..db import session_scope
-from ..models import Account, Biller, Request, RequestStatus, SavingsGoal, Transaction, TxnStatus, User
+from ..models import Account, Biller, Request, RequestStatus, SavingsGoal, Transaction, TxnKind, TxnStatus, User
 from ..schemas import (
     BalanceOut,
     BillerOut,
@@ -139,7 +139,7 @@ def get_history(user_id: int, limit: int = 50) -> HistoryResponse:
 
         # 14-day timeline: compute by walking transactions chronologically.
         # We'll start from current balance and subtract/apply deltas going back.
-        timeline = _build_timeline(s, acct.id, acct.balance_bdt, days=2)
+        timeline = _build_timeline(s, acct.id, acct.balance_bdt, days=14)
 
         return HistoryResponse(
             user_id=u.id,
@@ -191,7 +191,7 @@ def get_savings_goals(user_id: int) -> list[SavingsGoalOut]:
     with session_scope() as s:
         if s.get(User, user_id) is None:
             raise HTTPException(404, "user not found")
-        return [SavingsGoalOut.model_validate(g, from_attributes=True) for g in s.query(SavingsGoal).filter_by(user_id=user_id).order_by(SavingsGoal.created_at.desc()).all()]
+        return [SavingsGoalOut.model_validate(g) for g in s.query(SavingsGoal).filter_by(user_id=user_id).order_by(SavingsGoal.created_at.desc()).all()]
 
 
 @router.post("/users/{user_id}/savings-goals", response_model=SavingsGoalOut)
@@ -205,7 +205,7 @@ def create_savings_goal(user_id: int, payload: SavingsGoalCreate) -> SavingsGoal
             s.flush()
         except Exception as exc:
             raise HTTPException(409, "a savings goal for this festival already exists") from exc
-        return SavingsGoalOut.model_validate(goal, from_attributes=True)
+        return SavingsGoalOut.model_validate(goal)
 
 
 @router.post("/users/{user_id}/savings-goals/{goal_id}/contribute", response_model=SavingsGoalOut)
@@ -221,7 +221,7 @@ def contribute_savings(user_id: int, goal_id: int, payload: SavingsContribution)
             initiator_user_id=user_id, idempotency_key=transaction_key
         ).one_or_none()
         if existing is not None:
-            return SavingsGoalOut.model_validate(goal, from_attributes=True)
+            return SavingsGoalOut.model_validate(goal)
         if account.balance_bdt < payload.amount_bdt:
             raise HTTPException(422, "insufficient balance for this saving")
         account.balance_bdt -= payload.amount_bdt
@@ -230,14 +230,14 @@ def contribute_savings(user_id: int, goal_id: int, payload: SavingsContribution)
             initiator_user_id=user_id,
             from_account_id=account.id,
             amount_bdt=payload.amount_bdt,
-            kind="savings",
+            kind=TxnKind.SAVINGS.value,
             status=TxnStatus.COMPLETED.value,
             note=f"Saving for {goal.festival}",
             completed_at=_utcnow(),
         ))
         goal.saved_amount_bdt += payload.amount_bdt
         s.flush()
-        return SavingsGoalOut.model_validate(goal, from_attributes=True)
+        return SavingsGoalOut.model_validate(goal)
 
 
 @router.get("/users/{user_id}/requests", response_model=list[PendingRequestOut])
@@ -267,17 +267,25 @@ def get_pending_requests(user_id: int) -> list[PendingRequestOut]:
 
 
 @router.post("/requests/{request_id}/pay")
-def pay_request_endpoint(request_id: int, idempotency_key: str) -> dict:
-    """Mark a request as paid (pays the asker)."""
+def pay_request_endpoint(request_id: int, idempotency_key: str, user_id: int) -> dict:
+    """Mark a request as paid (pays the asker).
+
+    `user_id` must be the payer. Raises 403 if the caller is not the
+    designated payer on the request, preventing any authenticated user
+    from paying someone else's debt.
+    """
     from .. import engine as eng
 
     with session_scope() as s:
+        req_row = s.get(Request, request_id)
+        if req_row is None:
+            raise HTTPException(404, "request not found")
+        if req_row.payer_user_id != user_id:
+            raise HTTPException(403, "you are not the payer for this request")
         try:
             txn = eng.pay_request(
                 s,
-                payer_user_id=(
-                    s.query(Request).filter_by(id=request_id).one().payer_user_id
-                ),
+                payer_user_id=user_id,
                 request_id=request_id,
                 idempotency_key=idempotency_key,
             )

@@ -7,13 +7,11 @@ export function ReviewCard({
   onConfirm,
   onDecline,
   pending,
-  voiceListening,
 }: {
   resp: AgentActResponse;
   onConfirm: () => void;
   onDecline: () => void;
   pending?: boolean;
-  voiceListening?: boolean;
 }) {
   const card = resp.card;
   if (!card) return null;
@@ -24,12 +22,6 @@ export function ReviewCard({
         <div className="text-xs text-secondary uppercase tracking-wider">
           Confirm
         </div>
-        {voiceListening ? (
-          <div className="flex items-center gap-1.5 text-xs text-peach-500">
-            <span className="w-1.5 h-1.5 rounded-full bg-peach-500 mic-active" />
-            Say &quot;yes&quot; to confirm, &quot;no&quot; to cancel
-          </div>
-        ) : null}
       </div>
       <div className="text-cream text-base leading-relaxed mb-3">
         {resp.text}
@@ -61,6 +53,7 @@ export function ReviewCard({
       </div>
       <div className="flex gap-2">
         <button
+          type="button"
           onClick={onConfirm}
           disabled={pending}
           className="btn-peach rounded-lg px-5 py-2 flex-1 disabled:opacity-40"
@@ -68,6 +61,7 @@ export function ReviewCard({
           {pending ? "Working…" : "Confirm"}
         </button>
         <button
+          type="button"
           onClick={onDecline}
           disabled={pending}
           className="btn-ghost rounded-lg px-5 py-2 disabled:opacity-40"

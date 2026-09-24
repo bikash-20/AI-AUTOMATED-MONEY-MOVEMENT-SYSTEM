@@ -14,10 +14,11 @@ from sqlalchemy.orm import Session
 
 from .. import engine, llm, resolver
 from ..db import session_scope
-from ..models import Account, Request, RequestStatus, Transaction, TxnStatus, User
+from ..models import Account, Request, RequestStatus, Split, Transaction, TxnStatus, User
 from ..schemas import (
     AgentActRequest,
     AgentActResponse,
+    AgentActSplitRequest,
     AgentChatRequest,
     AgentChatResponse,
     AgentConfirmRequest,
@@ -82,15 +83,16 @@ def agent_act(req: AgentActRequest) -> AgentActResponse:
             .one_or_none()
         )
         if existing is not None:
+            current_balance = _post_debit_balance(s, req.user_id)
+            resulting = current_balance - existing.amount_bdt
             card = _review_card_for_send(existing, s)
+            card.resulting_balance_bdt = resulting
             text = llm.phrase(
                 "review_send",
                 {
                     "amount_bdt": str(existing.amount_bdt),
                     "recipient": card.recipient_label,
-                    "resulting_balance_bdt": str(
-                        _post_debit_balance(s, req.user_id) - existing.amount_bdt
-                    ),
+                    "resulting_balance_bdt": str(resulting),
                 },
             )
             return AgentActResponse(
@@ -207,16 +209,18 @@ def _handle_send(s, req, intent_dict, handles, user) -> AgentActResponse:
             note=intent_dict.get("note"),
         )
     except engine.IdempotencyReplay as r:
+        # Replay: compute the correct post-debit balance for the card.
+        current_balance = _post_debit_balance(s, user.id)
+        resulting = current_balance - r.txn.amount_bdt
         card = _review_card_for_send(r.txn, s)
+        card.resulting_balance_bdt = resulting
         return AgentActResponse(
             text=llm.phrase(
                 "review_send",
                 {
                     "amount_bdt": str(r.txn.amount_bdt),
                     "recipient": card.recipient_label,
-                    "resulting_balance_bdt": str(
-                        _post_debit_balance(s, user.id) - r.txn.amount_bdt
-                    ),
+                    "resulting_balance_bdt": str(resulting),
                 },
             ),
             card=card,
@@ -234,16 +238,6 @@ def _handle_send(s, req, intent_dict, handles, user) -> AgentActResponse:
         )
     except engine.EngineError as e:
         raise HTTPException(400, str(e))
-    except engine.IdempotencyReplay_for_request as replay:
-        return AgentActResponse(
-            text=llm.phrase(
-                "request_created",
-                {"payer": payer_handle, "amount_bdt": str(replay.req.amount_bdt)},
-            ),
-            action="request",
-            pending_id=replay.req.id,
-            idempotent_replay=True,
-        )
 
     card = _review_card_for_send(txn, s)
     resulting = _post_debit_balance(s, user.id) - amount
@@ -295,6 +289,17 @@ def _handle_request_action(s, req, intent_dict, handles, user) -> AgentActRespon
             amount=amount,
             idempotency_key=req.idempotency_key,
             note=intent_dict.get("note"),
+        )
+    except engine.IdempotencyReplay_for_request as replay:
+        # Idempotent replay: return the original request state.
+        return AgentActResponse(
+            text=llm.phrase(
+                "request_created",
+                {"payer": payer_handle, "amount_bdt": str(replay.req.amount_bdt)},
+            ),
+            action="request",
+            pending_id=replay.req.id,
+            idempotent_replay=True,
         )
     except engine.EngineError as e:
         raise HTTPException(400, str(e))
@@ -491,6 +496,184 @@ def agent_chat(req: AgentChatRequest) -> AgentChatResponse:
     elif any(g in norm for g in ("bye", "goodbye")):
         action = "bye"
     return AgentChatResponse(text=text, action=action)
+
+
+# ---- Explicit split (N-way) ------------------------------------------------
+@router.post("/act-split", response_model=AgentActResponse)
+def agent_act_split(req: AgentActSplitRequest) -> AgentActResponse:
+    """LLM-free split entry point used by the N-way chip-array UI.
+
+    Why this exists: voice/text must still flow through /agent/act (regex +
+    LLM cascade), but the chip-array form knows the recipients and amount
+    up-front. Sending the user through the orchestrator would force the
+    LLM to *re-discover* facts it didn't need to, and would round-trip
+    through Ollama at ~10s timeout per click.
+
+    Safety boundary: still routes through `engine.create_pending_split`
+    and `resolver.resolve_recipient` — the AI never owns the ledger. Only
+    the user-disambiguation step is skipped.
+    """
+    with session_scope() as s:
+        user = _user_by_id(s, req.user_id)
+        handles = engine.known_handles(s)
+
+        # De-dupe + preserve order. Reject empty.
+        seen: set[str] = set()
+        unique: list[str] = []
+        for h in req.recipient_handles:
+            h_clean = (h or "").strip()
+            if not h_clean:
+                continue
+            if h_clean.lower() in seen:
+                continue
+            seen.add(h_clean.lower())
+            unique.append(h_clean)
+        if len(unique) < 2:
+            raise HTTPException(422, "split needs at least 2 unique recipients")
+
+        # Idempotency pre-flight: same (initiator, key) — return the
+        # original pending child instead of re-running engine. The
+        # orchestrator's /agent/act does this for send/bill; we mirror
+        # the same behaviour for split so retries (browser double-clicks,
+        # network blips) never spawn extra pending rows.
+        #
+        # The engine mints child keys as `{parent_key}:{user_id}`. We
+        # compute the same prefix and look for any existing child.
+        child_key_prefix = f"{req.idempotency_key}:"
+        existing_child = (
+            s.query(Transaction)
+            .filter(
+                Transaction.initiator_user_id == user.id,
+                Transaction.kind == "split_child",
+                Transaction.idempotency_key.like(f"{child_key_prefix}%"),
+            )
+            .order_by(Transaction.id.asc())
+            .first()
+        )
+        if existing_child is not None:
+            existing_parent_id = existing_child.parent_split_id
+            siblings = (
+                s.query(Transaction)
+                .filter_by(parent_split_id=existing_parent_id)
+                .order_by(Transaction.id.asc())
+                .all()
+            )
+            recipient_handles_out = []
+            for sib in siblings:
+                if sib.to_account_id is None:
+                    continue
+                sib_user = (
+                    s.query(User).join(Account).filter(Account.id == sib.to_account_id).one_or_none()
+                )
+                if sib_user is not None:
+                    recipient_handles_out.append(sib_user.handle)
+            existing_split = s.get(Split, existing_parent_id) if existing_parent_id else None
+            per_amount_str = str(existing_split.per_amount_bdt) if existing_split else "0"
+            resulting = _post_debit_balance(s, user.id) - req.amount_bdt
+            card = ReviewCard(
+                kind="split",
+                amount_bdt=req.amount_bdt,
+                recipients=recipient_handles_out,
+                note=req.note,
+                resulting_balance_bdt=resulting,
+                initiator_handle=user.handle,
+                initiator_phone=user.phone,
+            )
+            text = llm.phrase(
+                "review_split",
+                {
+                    "total_amount_bdt": str(req.amount_bdt),
+                    "recipients": recipient_handles_out,
+                    "per_amount_bdt": per_amount_str,
+                    "resulting_balance_bdt": str(resulting),
+                },
+            )
+            return AgentActResponse(
+                text=text,
+                card=card,
+                action="split",
+                pending_id=existing_child.id,
+                idempotent_replay=True,
+            )
+
+        # Resolve (fuzzy). Same safety story as the orchestrator.
+        resolved: list[str] = []
+        for raw in unique:
+            try:
+                resolved.append(resolver.resolve_recipient(raw, handles))
+            except resolver.AmbiguousRecipient as e:
+                return AgentActResponse(
+                    text=llm.phrase("ambiguous_recipient", {"candidates": e.candidates}),
+                    action="split",
+                )
+            except resolver.UnknownRecipient as e:
+                return AgentActResponse(
+                    text=llm.phrase(
+                        "unknown_recipient",
+                        {"raw": raw, "known": handles},
+                    ),
+                    action="split",
+                )
+
+        try:
+            sp = engine.create_pending_split(
+                s,
+                initiator_user_id=user.id,
+                recipient_handles=resolved,
+                total_amount=req.amount_bdt,
+                idempotency_key=req.idempotency_key,
+                note=req.note,
+            )
+        except engine.InsufficientFunds as e:
+            return AgentActResponse(
+                text=llm.phrase(
+                    "insufficient_funds",
+                    {"balance_bdt": str(e.balance), "amount_bdt": str(e.amount)},
+                ),
+                action="split",
+            )
+        except engine.EngineError as e:
+            raise HTTPException(400, str(e))
+
+        resulting = _post_debit_balance(s, user.id) - req.amount_bdt
+        text = llm.phrase(
+            "review_split",
+            {
+                "total_amount_bdt": str(req.amount_bdt),
+                "recipients": resolved,
+                "per_amount_bdt": str(sp.per_amount_bdt),
+                "resulting_balance_bdt": str(resulting),
+            },
+        )
+        first_child = (
+            s.query(Transaction)
+            .filter_by(parent_split_id=sp.id, kind="split_child")
+            .order_by(Transaction.id.asc())
+            .first()
+        )
+        if first_child is None:
+            raise HTTPException(500, "split created without pending transactions")
+        card = ReviewCard(
+            kind="split",
+            amount_bdt=req.amount_bdt,
+            recipients=resolved,
+            note=req.note,
+            resulting_balance_bdt=resulting,
+            initiator_handle=user.handle,
+            initiator_phone=user.phone,
+        )
+        return AgentActResponse(
+            text=text,
+            card=card,
+            action="split",
+            pending_id=first_child.id,
+            data={
+                "split_id": sp.id,
+                "recipients": resolved,
+                "per_amount_bdt": str(sp.per_amount_bdt),
+                "total_amount_bdt": str(sp.total_amount_bdt),
+            },
+        )
 
 
 # ---- Confirm / Decline ------------------------------------------------------

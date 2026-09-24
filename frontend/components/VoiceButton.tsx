@@ -21,7 +21,7 @@ export function VoiceButton({
 
   useEffect(() => {
     return () => {
-      // cleanup
+      // cleanup on unmount
       try {
         recorderRef.current?.stop();
       } catch {}
@@ -83,14 +83,14 @@ export function VoiceButton({
     setRecording(false);
   }
 
-  const busy = recording || transcribing;
-
   return (
     <div className="flex items-center gap-2">
       <button
+        type="button"
         onClick={() => (recording ? stopRecording() : startRecording())}
         disabled={disabled || transcribing}
         title={recording ? "Tap to stop" : "Tap to talk"}
+        aria-pressed={recording}
         className={
           "rounded-full w-12 h-12 flex items-center justify-center transition-all " +
           (recording

@@ -5,13 +5,15 @@ import logging
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI
+from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import config, engine, voice_io
 from .db import SessionLocal, init_db
-from .routers import accounts, agent, voice
+from .routers import accounts, agent, insights, voice
 from .seed import seed
+from .services.event_bus import get_bus
+from .workers import categorizer_worker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,11 +33,14 @@ async def lifespan(app: FastAPI):
         log.info("seed: %s", result)
     # Start pending-txn TTL sweeper.
     engine.start_sweeper(SessionLocal)
+    # Start the categorizer worker (consumes categorize.requested events).
+    categorizer_worker.start_categorizer(get_bus())
     log.info("ready on http://%s:%d", config.APP_HOST, config.APP_PORT)
     try:
         yield
     finally:
         engine.stop_sweeper()
+        await categorizer_worker.stop_categorizer()
         voice_io.drain_and_stop()
         log.info("shutdown complete")
 
@@ -53,6 +58,7 @@ app.add_middleware(
 
 app.include_router(agent.router)
 app.include_router(accounts.router)
+app.include_router(insights.router)
 app.include_router(voice.router)
 
 
@@ -132,9 +138,6 @@ def get_settings() -> dict:
         "stt_model": config.STT_MODEL,
         "pending_ttl_seconds": config.PENDING_TTL_SECONDS,
     }
-
-
-from fastapi import Body  # noqa: E402
 
 
 @app.patch("/settings")

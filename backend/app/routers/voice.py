@@ -1,10 +1,13 @@
-"""Voice router: STT endpoint + TTS trigger (browser can also play returned
-audio from the chat path, but having a separate /speak endpoint keeps parity
-with the existing voice_server.py pattern)."""
+"""Voice router: STT endpoint + TTS endpoint.
+
+The /speak endpoint now returns WAV bytes synthesized by the configured
+TTS engine (Qwen3 / Edge / off). The browser plays them through an
+<audio> element so the user actually hears the *configured* voice — not
+the browser's built-in default.
+"""
 from __future__ import annotations
 
-import io
-import wave
+import asyncio
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Request
@@ -31,9 +34,22 @@ async def transcribe(
 
 @router.post("/speak")
 async def speak(request: Request) -> Response:
-    """Server-side TTS playback trigger. Browser can also play audio it gets
-    directly from the agent response, but this endpoint keeps symmetry with
-    the existing voice_server.py and lets the server pick the best voice."""
+    """Synthesize speech with the configured TTS engine and return WAV bytes.
+
+    The browser plays these bytes via an <audio> element. If synthesis
+    fails, we return 500 with the underlying error — the frontend surfaces
+    that to the user rather than silently falling back to a generic
+    browser voice (which is the bug this endpoint previously had).
+
+    `voice_io.synthesize` is sync and internally calls `asyncio.run()` for
+    the Edge TTS branch. Since this handler runs on the FastAPI event
+    loop, we MUST offload the work to a worker thread — otherwise the
+    inner `asyncio.run()` raises "cannot be called from a running event
+    loop". `asyncio.to_thread` is the idiomatic way; it gives us a real
+    fresh thread with no inherited loop, so Edge TTS's `asyncio.run`
+    succeeds. Same offload also keeps Qwen-TTS (multi-second synthesis)
+    from blocking the loop's other handlers.
+    """
     try:
         payload = await request.json()
     except Exception:
@@ -41,5 +57,13 @@ async def speak(request: Request) -> Response:
     text = (payload.get("text") or "").strip()
     if not text:
         raise HTTPException(400, "empty text")
-    voice_io.speak(text)
-    return JSONResponse({"queued": True})
+    try:
+        wav_bytes = await asyncio.to_thread(voice_io.synthesize, text)
+    except RuntimeError as e:
+        # Surface engine load / synthesis failures to the client. Do NOT
+        # fall back to a generic voice — the user has chosen Qwen/Edge and
+        # they should know if it failed.
+        raise HTTPException(500, f"tts failed: {e}") from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"tts failed: {type(e).__name__}: {e}") from e
+    return Response(content=wav_bytes, media_type="audio/wav")

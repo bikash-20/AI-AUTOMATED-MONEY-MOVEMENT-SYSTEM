@@ -41,6 +41,7 @@ class TxnKind(str, enum.Enum):
     REQUEST = "request"
     BILL = "bill"
     SPLIT_CHILD = "split_child"
+    SAVINGS = "savings"  # internal transfer to a savings goal; bypasses _execute()
 
 
 class TxnStatus(str, enum.Enum):
@@ -222,4 +223,41 @@ class SavingsGoal(Base):
         CheckConstraint("saved_amount_bdt >= 0", name="ck_goal_saved_nonneg"),
         UniqueConstraint("user_id", "festival", name="uq_user_festival_goal"),
         Index("ix_goal_user", "user_id"),
+    )
+
+
+class TxnTag(Base):
+    """A category tag applied to a transaction.
+
+    Tags are produced by:
+      - the categorizer worker (`source='auto'` or `source='llm'`) running
+        off the EventBus after a successful `_execute()`
+      - the user manually via `POST /users/{id}/transactions/{txn}/tags`
+        (`source='user'`).
+
+    UNIQUE(txn_id, tag_slug) makes tag application idempotent and lets
+    the user override an auto-tag by inserting the same slug with
+    source='user' (the engine layer never touches this; the routers
+    enforce the override semantics).
+    """
+
+    __tablename__ = "txn_tags"
+
+    id: Mapped[int] = mapped_column(_PKType, primary_key=True)
+    txn_id: Mapped[int] = mapped_column(
+        ForeignKey("transactions.id", ondelete="CASCADE"), nullable=False
+    )
+    tag_slug: Mapped[str] = mapped_column(String(32), nullable=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="auto")
+    by_user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.current_timestamp(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("txn_id", "tag_slug", name="uq_txn_tag"),
+        Index("ix_txn_tag_slug", "tag_slug"),
+        Index("ix_txn_tag_txn", "txn_id"),
     )

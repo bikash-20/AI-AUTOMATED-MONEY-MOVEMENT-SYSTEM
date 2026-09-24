@@ -162,6 +162,23 @@ class SavingsContribution(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=64)
 
 
+# ---- Explicit split (N-way, no LLM round-trip) -----------------------------
+class AgentActSplitRequest(BaseModel):
+    """Direct, LLM-free split entry point.
+
+    Used by the chip-array N-way split UI. The agent has no need to parse
+    a sentence — the UI already knows the recipients and amount, so we
+    skip the regex/OLLAMA cascade and call the engine directly. Keeps the
+    voice/text paths intact via /agent/act.
+    """
+
+    user_id: int
+    recipient_handles: list[str] = Field(min_length=2, max_length=8)
+    amount_bdt: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    note: Optional[str] = Field(default=None, max_length=140)
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+
 class BillerOut(BaseModel):
     id: int
     name: str

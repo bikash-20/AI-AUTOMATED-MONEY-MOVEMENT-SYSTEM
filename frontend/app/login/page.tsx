@@ -68,6 +68,7 @@ export default function LoginPage() {
             const isLoading = loadingId === u.id;
             return (
               <button
+                type="button"
                 key={u.id}
                 onClick={() => pick(u)}
                 disabled={loadingId !== null}
