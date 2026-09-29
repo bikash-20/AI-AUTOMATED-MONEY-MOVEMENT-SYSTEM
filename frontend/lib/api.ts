@@ -152,6 +152,20 @@ export const api = {
     ),
   agentAct: (body: { user_id: number; text: string; idempotency_key: string }) =>
     httpJson<AgentActResponse>("POST", "/agent/act", body),
+  agentActSend: (body: {
+    user_id: number;
+    recipient_handle: string;
+    amount_bdt: string;
+    note?: string;
+    idempotency_key: string;
+  }) => httpJson<AgentActResponse>("POST", "/agent/act-send", body),
+  agentActRequest: (body: {
+    user_id: number;
+    payer_handle: string;
+    amount_bdt: string;
+    note?: string;
+    idempotency_key: string;
+  }) => httpJson<AgentActResponse>("POST", "/agent/act-request", body),
   agentActSplit: (body: {
     user_id: number;
     recipient_handles: string[];

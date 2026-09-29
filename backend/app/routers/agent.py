@@ -17,7 +17,9 @@ from ..db import session_scope
 from ..models import Account, Request, RequestStatus, Split, Transaction, TxnStatus, User
 from ..schemas import (
     AgentActRequest,
+    AgentActRequestActionRequest,
     AgentActResponse,
+    AgentActSendRequest,
     AgentActSplitRequest,
     AgentChatRequest,
     AgentChatResponse,
@@ -673,6 +675,192 @@ def agent_act_split(req: AgentActSplitRequest) -> AgentActResponse:
                 "per_amount_bdt": str(sp.per_amount_bdt),
                 "total_amount_bdt": str(sp.total_amount_bdt),
             },
+        )
+
+
+# ---- Explicit send (Quick-send form on the dashboard) ----------------------
+@router.post("/act-send", response_model=AgentActResponse)
+def agent_act_send(req: AgentActSendRequest) -> AgentActResponse:
+    """LLM-free send entry point used by the Quick-send form.
+
+    Why this exists: voice/text must still flow through /agent/act (regex +
+    LLM cascade), but the Quick-send form knows the recipient and amount
+    up-front. Sending the user through the orchestrator would force the
+    LLM to *re-discover* facts it didn't need to, and would round-trip
+    through Ollama at ~10s timeout per click — which is exactly what made
+    "tap Send" feel broken.
+
+    Safety boundary: still routes through `engine.create_pending_send`
+    and `resolver.resolve_recipient` — the AI never owns the ledger. Only
+    the user-disambiguation step is skipped.
+    """
+    with session_scope() as s:
+        user = _user_by_id(s, req.user_id)
+        handles = engine.known_handles(s)
+
+        # Idempotency pre-flight: same (initiator, key) → return the existing
+        # pending row. Mirrors the orchestrator's behaviour so retries
+        # (browser double-clicks, network blips) never spawn extra pending
+        # rows. We patch the resulting_balance below because the user may
+        # have changed accounts since the original click.
+        existing = (
+            s.query(Transaction)
+            .filter_by(initiator_user_id=user.id, idempotency_key=req.idempotency_key)
+            .one_or_none()
+        )
+        if existing is not None:
+            current_balance = _post_debit_balance(s, user.id)
+            resulting = current_balance - existing.amount_bdt
+            card = _review_card_for_send(existing, s)
+            card.resulting_balance_bdt = resulting
+            text = llm.phrase(
+                "review_send",
+                {
+                    "amount_bdt": str(existing.amount_bdt),
+                    "recipient": card.recipient_label,
+                    "resulting_balance_bdt": str(resulting),
+                },
+            )
+            return AgentActResponse(
+                text=text,
+                card=card,
+                pending_id=existing.id,
+                action="send",
+                idempotent_replay=True,
+            )
+
+        # Resolve (fuzzy). Same safety story as the orchestrator.
+        try:
+            recipient = resolver.resolve_recipient(req.recipient_handle, handles)
+        except resolver.AmbiguousRecipient as e:
+            return AgentActResponse(
+                text=llm.phrase("ambiguous_recipient", {"candidates": e.candidates}),
+                action="send",
+            )
+        except resolver.UnknownRecipient as e:
+            return AgentActResponse(
+                text=llm.phrase(
+                    "unknown_recipient",
+                    {"raw": req.recipient_handle, "known": handles},
+                ),
+                action="send",
+            )
+
+        # Schema already validated amount_bdt > 0 and has 2dp, but route
+        # through resolver for symmetry with the orchestrator path.
+        try:
+            amount = resolver.resolve_amount(req.amount_bdt)
+        except resolver.ResolutionError as e:
+            raise HTTPException(422, e.message)
+
+        try:
+            txn = engine.create_pending_send(
+                s,
+                initiator_user_id=user.id,
+                recipient_handle=recipient,
+                amount=amount,
+                idempotency_key=req.idempotency_key,
+                note=req.note,
+            )
+        except engine.InsufficientFunds as e:
+            return AgentActResponse(
+                text=llm.phrase(
+                    "insufficient_funds",
+                    {"balance_bdt": str(e.balance), "amount_bdt": str(e.amount)},
+                ),
+                action="send",
+            )
+        except engine.EngineError as e:
+            raise HTTPException(400, str(e))
+
+        resulting = _post_debit_balance(s, user.id) - amount
+        card = _review_card_for_send(txn, s)
+        card.resulting_balance_bdt = resulting
+        text = llm.phrase(
+            "review_send",
+            {
+                "amount_bdt": str(amount),
+                "recipient": recipient,
+                "resulting_balance_bdt": str(resulting),
+            },
+        )
+        return AgentActResponse(
+            text=text,
+            card=card,
+            action="send",
+            pending_id=txn.id,
+        )
+
+
+# ---- Explicit request (Ask-for-money modal) --------------------------------
+@router.post("/act-request", response_model=AgentActResponse)
+def agent_act_request(req: AgentActRequestActionRequest) -> AgentActResponse:
+    """LLM-free request-money entry point used by the Ask modal.
+
+    Creates a pending Request row that the payer's dashboard will surface
+    via /users/{id}/requests. No ReviewCard is returned — the request flow
+    has no review step; the asker is told the request was created.
+    """
+    with session_scope() as s:
+        user = _user_by_id(s, req.user_id)
+        handles = engine.known_handles(s)
+
+        # Resolve the payer handle (fuzzy).
+        try:
+            payer_handle = resolver.resolve_recipient(req.payer_handle, handles)
+        except resolver.AmbiguousRecipient as e:
+            return AgentActResponse(
+                text=llm.phrase("ambiguous_recipient", {"candidates": e.candidates}),
+                action="request",
+            )
+        except resolver.UnknownRecipient as e:
+            return AgentActResponse(
+                text=llm.phrase(
+                    "unknown_recipient",
+                    {"raw": req.payer_handle, "known": handles},
+                ),
+                action="request",
+            )
+
+        try:
+            amount = resolver.resolve_amount(req.amount_bdt)
+        except resolver.ResolutionError as e:
+            raise HTTPException(422, e.message)
+
+        try:
+            req_row = engine.create_pending_request(
+                s,
+                initiator_user_id=user.id,
+                payer_handle=payer_handle,
+                amount=amount,
+                idempotency_key=req.idempotency_key,
+                note=req.note,
+            )
+        except engine.IdempotencyReplay_for_request as replay:
+            # Idempotent replay: return the original request.
+            return AgentActResponse(
+                text=llm.phrase(
+                    "request_created",
+                    {
+                        "payer": payer_handle,
+                        "amount_bdt": str(replay.req.amount_bdt),
+                    },
+                ),
+                action="request",
+                pending_id=replay.req.id,
+                idempotent_replay=True,
+            )
+        except engine.EngineError as e:
+            raise HTTPException(400, str(e))
+
+        text = llm.phrase(
+            "request_created",
+            {"payer": payer_handle, "amount_bdt": str(amount)},
+        )
+        return AgentActResponse(
+            text=text,
+            action="request",
+            pending_id=req_row.id,
         )
 
 

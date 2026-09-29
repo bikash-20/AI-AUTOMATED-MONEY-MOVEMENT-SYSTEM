@@ -1,21 +1,81 @@
-"""Voice router: STT endpoint + TTS endpoint.
+"""Voice router: STT endpoint + TTS endpoint + readiness probe.
 
-The /speak endpoint now returns WAV bytes synthesized by the configured
+The /speak endpoint returns WAV bytes synthesized by the configured
 TTS engine (Qwen3 / Edge / off). The browser plays them through an
 <audio> element so the user actually hears the *configured* voice — not
 the browser's built-in default.
+
+The /wake-status endpoint is a lightweight readiness probe so the
+frontend can show "voice ready" without triggering a real STT/TTS call
+(which would force model load on first hit and add 10–30s latency).
 """
 from __future__ import annotations
 
 import asyncio
+import threading
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
-from .. import voice_io
+from .. import config, voice_io
 
 router = APIRouter(prefix="/voice", tags=["voice"])
+
+
+# Track which engines have been initialized in this process. Lazy-loaded
+# engines don't report `loaded: true` until they've actually been called.
+_engine_state = {
+    "stt_loaded": False,
+    "stt_lock": threading.Lock(),
+}
+
+
+def _ensure_stt_warm() -> bool:
+    """Trigger STT model load in background if not yet loaded.
+    Returns True if warm, False if still loading."""
+    with _engine_state["stt_lock"]:
+        if _engine_state["stt_loaded"]:
+            return True
+        # Lazy-load in this thread. Model load is heavy (10–30s first time)
+        # so this blocks — but it's only called once per process lifetime
+        # from /wake-status after the dashboard mounts. Subsequent calls
+        # return immediately.
+        try:
+            voice_io.get_stt().get()
+            _engine_state["stt_loaded"] = True
+            return True
+        except Exception:
+            return False
+
+
+@router.get("/wake-status")
+async def wake_status() -> JSONResponse:
+    """Report voice pipeline readiness.
+
+    Used by the frontend voice system to:
+      - decide whether to show "voice ready" vs "voice warming up"
+      - trigger background STT pre-warm (avoiding cold-start latency
+        on the user's first voice command)
+
+    Does NOT touch TTS — TTS is lazy and the first /voice/speak call
+    will warm it on demand. We don't pre-warm TTS here because Qwen3-TTS
+    load is also expensive (10s+) and the user might not actually use
+    voice at all.
+    """
+    # Fire-and-forget background warm. Don't block the response on it.
+    threading.Thread(target=_ensure_stt_warm, daemon=True).start()
+    return JSONResponse({
+        "stt_model": config.STT_MODEL,
+        "stt_loaded": _engine_state["stt_loaded"],
+        "tts_engine": config.TTS_ENGINE,
+        "tts_voice": (
+            config.EDGE_TTS_VOICE
+            if (config.TTS_ENGINE or "").strip().lower() == "edge"
+            else config.QWEN_TTS_VOICE
+        ),
+        "ready": _engine_state["stt_loaded"],
+    })
 
 
 @router.post("/transcribe")
@@ -27,6 +87,8 @@ async def transcribe(
         raise HTTPException(400, "empty audio")
     try:
         text, lang, dur = voice_io.get_stt().transcribe_bytes(audio, language=language)
+        # Mark STT as loaded once a successful transcribe completes.
+        _engine_state["stt_loaded"] = True
     except Exception as e:
         raise HTTPException(500, f"transcribe failed: {e}")
     return JSONResponse({"text": text, "language": lang, "duration": dur})

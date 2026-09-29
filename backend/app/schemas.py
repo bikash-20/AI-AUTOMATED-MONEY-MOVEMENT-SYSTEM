@@ -162,6 +162,41 @@ class SavingsContribution(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=64)
 
 
+# ---- Explicit send (no LLM round-trip) -------------------------------------
+class AgentActSendRequest(BaseModel):
+    """Direct, LLM-free send entry point.
+
+    Used by the Quick-send form on the dashboard. The UI already knows the
+    recipient and amount, so we skip the regex/OLLAMA cascade and call the
+    engine directly. Keeps the voice/text paths intact via /agent/act.
+
+    Pending-review-card flow is preserved: caller gets an AgentActResponse
+    with a ReviewCard that must be confirmed via /agent/confirm (decision=
+    'confirm' or 'decline').
+    """
+
+    user_id: int
+    recipient_handle: str = Field(min_length=1, max_length=32)
+    amount_bdt: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    note: Optional[str] = Field(default=None, max_length=140)
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+
+class AgentActRequestActionRequest(BaseModel):
+    """Direct, LLM-free request-money entry point used by the Ask modal.
+
+    Creates a pending Request row. The payer's dashboard picks it up via
+    /users/{id}/requests. No ReviewCard is needed (no review step in the
+    request flow itself).
+    """
+
+    user_id: int
+    payer_handle: str = Field(min_length=1, max_length=32)
+    amount_bdt: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    note: Optional[str] = Field(default=None, max_length=140)
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+
 # ---- Explicit split (N-way, no LLM round-trip) -----------------------------
 class AgentActSplitRequest(BaseModel):
     """Direct, LLM-free split entry point.

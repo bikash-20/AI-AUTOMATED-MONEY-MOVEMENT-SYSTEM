@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
 import { AgentActResponse, HistoryResponse, PendingRequest, User, api } from "@/lib/api";
@@ -13,12 +13,14 @@ import { ReviewCard } from "@/components/ReviewCard";
 import { HistoryList } from "@/components/HistoryList";
 import { PendingRequests } from "@/components/PendingRequests";
 import { VoiceButton } from "@/components/VoiceButton";
+import { VoiceOrb } from "@/components/VoiceOrb";
 import { ChatBar } from "@/components/ChatBar";
 import { SplitForm } from "@/components/SplitForm";
 import { SavingsGoals } from "@/components/SavingsGoals";
 import { AnimatePresence, motion } from "framer-motion";
 import { HandCoins, LogOut, Settings } from "lucide-react";
 import { speakText, subscribeSpeaking } from "@/lib/speech";
+import { useVoiceLoop } from "@/hooks/useVoiceLoop";
 
 const BalanceChart = dynamic(
   () => import("@/components/BalanceChart").then((module) => module.BalanceChart),
@@ -40,7 +42,11 @@ export default function DashboardPage() {
   const [history, setHistory] = useState<HistoryResponse | null>(null);
   const [requests, setRequests] = useState<PendingRequest[]>([]);
   const [reviewResp, setReviewResp] = useState<AgentActResponse | null>(null);
-  const [pendingKey, setPendingKey] = useState<string | null>(null);
+  // Use a ref (not state) so handleConfirm / handleDecline always read the
+  // freshest key, even if a new sendIntent call lands before the previous
+  // render commits. Stored on the reviewResp itself is fine too, but a ref
+  // keeps the wire shape untouched.
+  const pendingKeyRef = useRef<string | null>(null);
   const [working, setWorking] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -97,6 +103,13 @@ export default function DashboardPage() {
     }
   }, [activeId, refresh]);
 
+  // ---- Voice system -------------------------------------------------------
+  // The voice loop owns its own lifecycle. It activates once activeId is
+  // known and runs the wake-word → STT → /agent/act → confirm pipeline.
+  // After every voice-initiated action, refresh() so the UI reflects the
+  // new balance/history.
+  useVoiceLoop(activeId ?? 0, () => { refresh().catch(() => {}); });
+
   // Toast auto-dismiss.
   useEffect(() => {
     if (!toast) return;
@@ -134,8 +147,35 @@ export default function DashboardPage() {
     amount: string;
     note: string;
   }) {
-    const text = `send ${amount} to ${recipient}${note ? ` for ${note}` : ""}`;
-    await sendIntent(text);
+    if (!activeId) return;
+    setWorking(true);
+    setReviewResp(null);
+    try {
+      const key = newIdempotencyKey();
+      pendingKeyRef.current = key;
+      // Direct, LLM-free send. No Ollama round-trip, no regex parser
+      // racing with structured input. The chat/voice paths still flow
+      // through /agent/act untouched.
+      const resp = await api.agentActSend({
+        user_id: activeId,
+        recipient_handle: recipient,
+        amount_bdt: amount,
+        note: note || undefined,
+        idempotency_key: key,
+      });
+      if (resp.card && resp.pending_id) {
+        setReviewResp(resp);
+      } else {
+        setToast(resp.text);
+        safeSpeak(resp.text);
+      }
+    } catch (e) {
+      const message = `Error: ${(e as Error).message}`;
+      setToast(message);
+      safeSpeak("I could not complete that send.");
+    } finally {
+      setWorking(false);
+    }
   }
 
   // ---- Send (via voice transcript / chat input) -------------------------
@@ -145,7 +185,7 @@ export default function DashboardPage() {
     setReviewResp(null);
     try {
       const key = newIdempotencyKey();
-      setPendingKey(key);
+      pendingKeyRef.current = key;
       const resp = await api.agentAct({ user_id: activeId, text, idempotency_key: key });
       if (resp.card && resp.pending_id) {
         setReviewResp(resp);
@@ -168,7 +208,9 @@ export default function DashboardPage() {
   }
 
   async function handleConfirm() {
-    if (!reviewResp || !reviewResp.pending_id || !activeId || !pendingKey) return;
+    if (!reviewResp || !reviewResp.pending_id || !activeId) return;
+    const pendingKey = pendingKeyRef.current;
+    if (!pendingKey) return;
     setWorking(true);
     try {
       const r = await api.agentConfirm({
@@ -178,7 +220,7 @@ export default function DashboardPage() {
         decision: "confirm",
       });
       setReviewResp(null);
-      setPendingKey(null);
+      pendingKeyRef.current = null;
       setToast(r.text);
       safeSpeak(r.text);
       await refresh();
@@ -191,7 +233,9 @@ export default function DashboardPage() {
   }
 
   async function handleDecline() {
-    if (!reviewResp || !reviewResp.pending_id || !activeId || !pendingKey) return;
+    if (!reviewResp || !reviewResp.pending_id || !activeId) return;
+    const pendingKey = pendingKeyRef.current;
+    if (!pendingKey) return;
     setWorking(true);
     try {
       const r = await api.agentConfirm({
@@ -201,7 +245,7 @@ export default function DashboardPage() {
         decision: "decline",
       });
       setReviewResp(null);
-      setPendingKey(null);
+      pendingKeyRef.current = null;
       setToast(r.text);
       safeSpeak(r.text);
       await refresh();
@@ -272,13 +316,32 @@ export default function DashboardPage() {
 
   // ---- Ask for money (request flow) -------------------------------------
   async function handleAsk() {
-    if (!askRecipient || !askAmount) {
+    if (!askRecipient || !askAmount || !activeId) {
       setToast("Pick someone and enter an amount.");
       return;
     }
-    const note = askNote ? ` for ${askNote}` : "";
     setAskOpen(false);
-    await sendIntent(`request ${askAmount} from ${askRecipient}${note}`);
+    setWorking(true);
+    try {
+      const key = newIdempotencyKey();
+      // Direct, LLM-free request creation. Same shape as Quick-send.
+      const resp = await api.agentActRequest({
+        user_id: activeId,
+        payer_handle: askRecipient,
+        amount_bdt: askAmount,
+        note: askNote || undefined,
+        idempotency_key: key,
+      });
+      setToast(resp.text);
+      safeSpeak(resp.text);
+      setAskAmount("");
+      setAskNote("");
+    } catch (e) {
+      setToast(`Ask failed: ${(e as Error).message}`);
+      safeSpeak("I could not send that request.");
+    } finally {
+      setWorking(false);
+    }
   }
 
   async function handleSplit({ recipients, amount }: { recipients: string[]; amount: string }) {
@@ -292,7 +355,7 @@ export default function DashboardPage() {
     setReviewResp(null);
     try {
       const key = newIdempotencyKey();
-      setPendingKey(key);
+      pendingKeyRef.current = key;
       // N-way split goes through the explicit endpoint — no LLM
       // round-trip, no regex parser racing with chip-array input. Voice
       // and text splits still flow through sendIntent / /agent/act.
@@ -507,9 +570,12 @@ export default function DashboardPage() {
         </div>
       </motion.div>
 
+      {/* Voice orb — always-on voice indicator (floating bottom-center) */}
+      <VoiceOrb />
+
       {/* Toast */}
       {toast ? (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 glass-strong rounded-full px-5 py-3 text-sm text-cream max-w-md text-center shadow-glow-peach">
+        <div className="fixed top-6 left-1/2 -translate-x-1/2 glass-strong rounded-full px-5 py-3 text-sm text-cream max-w-md text-center shadow-glow-peach">
           {toast}
         </div>
       ) : null}
