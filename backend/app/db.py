@@ -63,31 +63,55 @@ def init_db() -> None:
     # Lightweight development migration for the existing SQLite demo DB.
     # Production deployments should run a real migration tool such as Alembic.
     if _engine.dialect.name == "sqlite":
-        columns = {column["name"] for column in inspect(_engine).get_columns("requests")}
-        if "idempotency_key" not in columns:
-            with _engine.begin() as connection:
-                connection.execute(
-                    text("ALTER TABLE requests ADD COLUMN idempotency_key VARCHAR(64) NOT NULL DEFAULT ''")
-                )
+        _migrate_requests_idempotency_key()
+        _migrate_users_face_columns()
+
+
+def _migrate_requests_idempotency_key() -> None:
+    """Backfill the requests.idempotency_key column on legacy DBs."""
+    columns = {column["name"] for column in inspect(_engine).get_columns("requests")}
+    if "idempotency_key" not in columns:
         with _engine.begin() as connection:
-            legacy_rows = connection.execute(
+            connection.execute(
+                text("ALTER TABLE requests ADD COLUMN idempotency_key VARCHAR(64) NOT NULL DEFAULT ''")
+            )
+    with _engine.begin() as connection:
+        legacy_rows = connection.execute(
+            text(
+                "SELECT id FROM requests "
+                "WHERE idempotency_key IS NULL OR idempotency_key = ''"
+            )
+        ).scalars().all()
+        for request_id in legacy_rows:
+            connection.execute(
                 text(
-                    "SELECT id FROM requests "
-                    "WHERE idempotency_key IS NULL OR idempotency_key = ''"
-                )
-            ).scalars().all()
-            for request_id in legacy_rows:
-                connection.execute(
-                    text(
-                        "UPDATE requests SET idempotency_key = :key "
-                        "WHERE id = :request_id"
-                    ),
-                    {"key": f"legacy-request:{request_id}", "request_id": request_id},
-                )
-            connection.execute(text(
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_request_idem "
-                "ON requests (asker_user_id, idempotency_key)"
-            ))
+                    "UPDATE requests SET idempotency_key = :key "
+                    "WHERE id = :request_id"
+                ),
+                {"key": f"legacy-request:{request_id}", "request_id": request_id},
+            )
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_request_idem "
+            "ON requests (asker_user_id, idempotency_key)"
+        ))
+
+
+def _migrate_users_face_columns() -> None:
+    """Add the Face ID columns to users on legacy DBs.
+
+    Both columns are nullable — NULL embedding means "not enrolled".
+    Idempotent: skipped if columns already exist.
+    """
+    columns = {column["name"] for column in inspect(_engine).get_columns("users")}
+    with _engine.begin() as connection:
+        if "face_embedding" not in columns:
+            connection.execute(
+                text("ALTER TABLE users ADD COLUMN face_embedding BLOB")
+            )
+        if "face_enrolled_at" not in columns:
+            connection.execute(
+                text("ALTER TABLE users ADD COLUMN face_enrolled_at DATETIME")
+            )
 
 
 @contextmanager

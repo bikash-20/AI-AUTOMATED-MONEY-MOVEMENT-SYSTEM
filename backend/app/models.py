@@ -17,6 +17,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -68,6 +69,11 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.current_timestamp(), nullable=False
     )
+    # Face ID enrollment (demo): opaque 128-dim float32 embedding produced
+    # by face-api.js on the client. We never see the raw face image — the
+    # webcam frames stay in the browser. NULL = not enrolled.
+    face_embedding: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
+    face_enrolled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     account: Mapped["Account"] = relationship(back_populates="user", uselist=False)
 

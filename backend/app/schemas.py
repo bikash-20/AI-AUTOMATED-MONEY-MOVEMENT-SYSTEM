@@ -219,3 +219,55 @@ class BillerOut(BaseModel):
     name: str
     category: str
     account_number: str
+
+
+# ---- Face ID (demo biometric) ----------------------------------------------
+# All face matching happens in the browser via face-api.js. The server only
+# stores an opaque 128-dim float32 embedding (as a JSON array, marshalled
+# to a compact bytes blob) and the enrollment timestamp. We never see the
+# raw face image — the webcam frames stay in the browser.
+
+FACE_EMBEDDING_DIM = 128
+
+
+class FaceEnrollRequest(BaseModel):
+    """Body for `POST /users/{id}/face`. Overwrites any prior enrollment."""
+
+    embedding: list[float] = Field(
+        ...,
+        description="128-dimensional float vector produced by face-api.js.",
+        min_length=FACE_EMBEDDING_DIM,
+        max_length=FACE_EMBEDDING_DIM,
+    )
+
+    @field_validator("embedding")
+    @classmethod
+    def _check_embedding_finite(cls, v: list[float]) -> list[float]:
+        # Reject NaN / Inf — the similarity metric would be meaningless.
+        for i, x in enumerate(v):
+            if x != x or x in (float("inf"), float("-inf")):
+                raise ValueError(f"embedding[{i}] must be finite")
+        return v
+
+
+class FaceStatusResponse(BaseModel):
+    """Body for `GET /users/{id}/face/status`."""
+
+    user_id: int
+    enrolled: bool
+    enrolled_at: Optional[datetime] = None
+
+
+class FaceEnrollResponse(BaseModel):
+    """Body for `POST /users/{id}/face`."""
+
+    user_id: int
+    enrolled: bool
+    enrolled_at: datetime
+
+
+class FaceDeleteResponse(BaseModel):
+    """Body for `DELETE /users/{id}/face`."""
+
+    user_id: int
+    enrolled: bool

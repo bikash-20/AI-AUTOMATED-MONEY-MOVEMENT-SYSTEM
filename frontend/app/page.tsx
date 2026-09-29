@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
-import { AgentActResponse, HistoryResponse, PendingRequest, User, api } from "@/lib/api";
+import { AgentActResponse, FaceStatus, HistoryResponse, PendingRequest, User, api } from "@/lib/api";
 import { newIdempotencyKey } from "@/lib/idempotency";
 import { clearActiveUserId, readActiveUserId, writeActiveUserId } from "@/lib/session";
 import { SessionSwitcher } from "@/components/SessionSwitcher";
@@ -18,7 +18,7 @@ import { ChatBar } from "@/components/ChatBar";
 import { SplitForm } from "@/components/SplitForm";
 import { SavingsGoals } from "@/components/SavingsGoals";
 import { AnimatePresence, motion } from "framer-motion";
-import { HandCoins, LogOut, Settings } from "lucide-react";
+import { HandCoins, LogOut, Scan, ShieldCheck, Settings as SettingsIcon } from "lucide-react";
 import { speakText, subscribeSpeaking } from "@/lib/speech";
 import { useVoiceLoop } from "@/hooks/useVoiceLoop";
 
@@ -31,6 +31,11 @@ const BalanceChart = dynamic(
 );
 const SettingsModal = dynamic(
   () => import("@/components/SettingsModal").then((module) => module.SettingsModal),
+  { ssr: false }
+);
+const FaceIDConfirm = dynamic(
+  () =>
+    import("@/components/FaceIDConfirm").then((m) => m.FaceIDConfirm),
   { ssr: false }
 );
 
@@ -55,6 +60,13 @@ export default function DashboardPage() {
   const [askAmount, setAskAmount] = useState("");
   const [askNote, setAskNote] = useState("");
   const [splitOpen, setSplitOpen] = useState(false);
+
+  // Face ID state. `faceStatus` reflects the SERVER's view (used for the
+  // header indicator and to decide whether FaceIDConfirm should open).
+  // The localStorage copy is checked inside FaceIDConfirm itself when it
+  // needs the stored vector to score against.
+  const [faceStatus, setFaceStatus] = useState<FaceStatus | null>(null);
+  const [faceConfirmOpen, setFaceConfirmOpen] = useState(false);
 
   // Bot speaking flag — used to disable the mic so the bot's own audio
   // isn't picked up as a new user command. Source of truth lives in
@@ -100,6 +112,12 @@ export default function DashboardPage() {
     if (activeId !== null) {
       refresh().catch((e) => setToast(`Load failed: ${(e as Error).message}`));
       writeActiveUserId(activeId);
+      // Refresh Face ID status alongside everything else. Non-fatal —
+      // an enrollment could have been added or removed on another tab.
+      api
+        .getFaceStatus(activeId)
+        .then(setFaceStatus)
+        .catch(() => setFaceStatus({ user_id: activeId, enrolled: false, enrolled_at: null }));
     }
   }, [activeId, refresh]);
 
@@ -209,8 +227,21 @@ export default function DashboardPage() {
 
   async function handleConfirm() {
     if (!reviewResp || !reviewResp.pending_id || !activeId) return;
+    // If this user has enrolled a face, gate the confirm on a successful
+    // Face ID match. If not enrolled, fall through to the regular
+    // confirm — the demo is intentionally non-blocking.
+    if (faceStatus?.enrolled) {
+      setFaceConfirmOpen(true);
+      return;
+    }
+    await confirmAfterFaceID();
+  }
+
+  async function confirmAfterFaceID() {
+    if (!reviewResp || !reviewResp.pending_id || !activeId) return;
     const pendingKey = pendingKeyRef.current;
     if (!pendingKey) return;
+    setFaceConfirmOpen(false);
     setWorking(true);
     try {
       const r = await api.agentConfirm({
@@ -433,13 +464,39 @@ export default function DashboardPage() {
             <HandCoins size={17} strokeWidth={1.8} />
             <span>Request money</span>
           </button>
+          {faceStatus ? (
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(true)}
+              title={
+                faceStatus.enrolled
+                  ? "Face ID enrolled — click to manage"
+                  : "Face ID not enrolled — click to set up"
+              }
+              className={
+                "btn-ghost rounded-full w-10 h-10 flex items-center justify-center text-sm " +
+                (faceStatus.enrolled ? "ring-1 ring-mint-400/40" : "")
+              }
+              data-testid="face-id-indicator"
+            >
+              {faceStatus.enrolled ? (
+                <ShieldCheck
+                  size={17}
+                  strokeWidth={1.8}
+                  className="text-mint-400"
+                />
+              ) : (
+                <Scan size={17} strokeWidth={1.8} className="text-cream/60" />
+              )}
+            </button>
+          ) : null}
           <button
             type="button"
             onClick={() => setSettingsOpen(true)}
             title="Settings"
             className="btn-ghost rounded-full w-10 h-10 flex items-center justify-center text-sm"
           >
-            <Settings size={17} strokeWidth={1.8} />
+            <SettingsIcon size={17} strokeWidth={1.8} />
           </button>
           <VoiceButton
             disabled={headerMicDisabled}
@@ -573,6 +630,24 @@ export default function DashboardPage() {
       {/* Voice orb — always-on voice indicator (floating bottom-center) */}
       <VoiceOrb />
 
+      {/* Face ID confirm overlay — gates the actual /agent/confirm call
+          on a successful face match. Only opens when the user has an
+          active enrollment; un-enrolled users fall through to the
+          regular confirm path. */}
+      <AnimatePresence>
+        {faceConfirmOpen && activeId !== null ? (
+          <FaceIDConfirm
+            userId={activeId}
+            onMatch={confirmAfterFaceID}
+            onCancel={() => setFaceConfirmOpen(false)}
+            onEnrollInstead={() => {
+              setFaceConfirmOpen(false);
+              setSettingsOpen(true);
+            }}
+          />
+        ) : null}
+      </AnimatePresence>
+
       {/* Toast */}
       {toast ? (
         <div className="fixed top-6 left-1/2 -translate-x-1/2 glass-strong rounded-full px-5 py-3 text-sm text-cream max-w-md text-center shadow-glow-peach">
@@ -584,6 +659,7 @@ export default function DashboardPage() {
       <SettingsModal
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
+        userId={activeId}
       />
 
       {/* Ask-for-money modal */}

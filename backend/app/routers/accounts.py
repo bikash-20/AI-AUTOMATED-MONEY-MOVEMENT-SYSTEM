@@ -1,6 +1,7 @@
-"""Accounts, history, pending requests, billers, session switching."""
+"""Accounts, history, pending requests, billers, session switching, Face ID."""
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
@@ -19,6 +20,10 @@ from ..models import Account, Biller, Request, RequestStatus, SavingsGoal, Trans
 from ..schemas import (
     BalanceOut,
     BillerOut,
+    FaceDeleteResponse,
+    FaceEnrollRequest,
+    FaceEnrollResponse,
+    FaceStatusResponse,
     HistoryResponse,
     PendingRequestOut,
     SavingsContribution,
@@ -27,6 +32,31 @@ from ..schemas import (
     TxnOut,
     UserOut,
 )
+
+
+# ---- Face ID embedding (de)serialisation -----------------------------------
+# We store the 128-dim float32 vector produced by face-api.js as a JSON-encoded
+# UTF-8 byte blob inside `users.face_embedding` (LargeBinary). Storing as JSON
+# (rather than raw float32 bytes) keeps the column human-readable for ops and
+# matches the wire format the browser already uses (a JS Float32Array →
+# plain array of numbers). Per-user footprint is ~1.5 KB.
+
+
+def _pack_embedding(vec: list[float]) -> bytes:
+    """Serialise a validated 128-dim float vector for storage."""
+    return json.dumps(vec, separators=(",", ":")).encode("utf-8")
+
+
+def _unpack_embedding(blob: bytes) -> list[float]:
+    """Reverse of _pack_embedding. Defensive: returns [] on any decode error
+    rather than crashing a status call (status reads must never 500)."""
+    try:
+        vec = json.loads(blob.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(vec, list):
+        return []
+    return [float(x) for x in vec]
 
 router = APIRouter(tags=["accounts"])
 
@@ -320,3 +350,100 @@ def list_billers() -> list[BillerOut]:
             BillerOut(id=b.id, name=b.name, category=b.category, account_number=b.account_number)
             for b in rows
         ]
+
+
+# ---- Face ID -----------------------------------------------------------------
+# Browser-side flow:
+#   1. The settings UI loads face-api.js models, opens the webcam, runs the
+#      detector on a frame, and calls /face/status to learn whether this user
+#      is already enrolled.
+#   2. If not enrolled, the UI shows an enroll modal: capture a frame, extract
+#      the 128-dim descriptor, POST it to /face. The server stores it as an
+#      opaque blob. We never see the raw image.
+#   3. During payment confirmation, the UI re-opens the camera, runs the
+#      detector, computes cosine similarity against the stored embedding, and
+#      only fires /agent/confirm if the score exceeds the threshold (default
+#      0.6 — same convention as face-api.js). The server is NOT in the loop
+#      for matching; it just gates the confirm call by accepting the request.
+#
+# Threat model: this is a *demo* biometric. It raises the cost of accidental
+# shoulder-surfing and stops a casual user from confirming while a different
+# person is at the screen. It is NOT a security boundary — the matching is
+# fully client-side and trivially bypassable by anyone with browser DevTools.
+
+# L2-normalised cosine similarity, computed identically client- and server-side.
+# We expose it only for tests; the live confirm path runs in the browser.
+FACE_MATCH_THRESHOLD = 0.6
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Standard cosine similarity. Returns 0.0 on dimension mismatch.
+
+    Face-api.js always emits a 128-dim vector, and the request schema
+    enforces that. If we ever see a different length in stored data
+    (corruption, schema drift), treat it as no match rather than risk
+    a coincidental shared-prefix false positive.
+    """
+    if len(a) != len(b) or len(a) == 0:
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na <= 0.0 or nb <= 0.0:
+        return 0.0
+    return dot / ((na ** 0.5) * (nb ** 0.5))
+
+
+@router.get("/users/{user_id}/face/status", response_model=FaceStatusResponse)
+def get_face_status(user_id: int) -> FaceStatusResponse:
+    """Whether this user has enrolled a face. Never 500s — the UI relies on
+    this during initial bootstrap."""
+    with session_scope() as s:
+        u = s.get(User, user_id)
+        if u is None:
+            raise HTTPException(404, "user not found")
+        return FaceStatusResponse(
+            user_id=u.id,
+            enrolled=u.face_embedding is not None,
+            enrolled_at=u.face_enrolled_at,
+        )
+
+
+@router.post("/users/{user_id}/face", response_model=FaceEnrollResponse)
+def enroll_face(user_id: int, payload: FaceEnrollRequest) -> FaceEnrollResponse:
+    """Upsert the user's face embedding.
+
+    Re-enrollment is allowed and overwrites the previous blob + timestamp.
+    The Pydantic validator already enforced dimensionality and finite values,
+    so by the time we reach this body the vector is well-formed.
+    """
+    with session_scope() as s:
+        u = s.get(User, user_id)
+        if u is None:
+            raise HTTPException(404, "user not found")
+        u.face_embedding = _pack_embedding(payload.embedding)
+        u.face_enrolled_at = _utcnow()
+        s.flush()
+        return FaceEnrollResponse(
+            user_id=u.id,
+            enrolled=True,
+            enrolled_at=u.face_enrolled_at,
+        )
+
+
+@router.delete("/users/{user_id}/face", response_model=FaceDeleteResponse)
+def delete_face(user_id: int) -> FaceDeleteResponse:
+    """Clear any prior enrollment. Idempotent: returns enrolled=false whether
+    or not anything was actually present."""
+    with session_scope() as s:
+        u = s.get(User, user_id)
+        if u is None:
+            raise HTTPException(404, "user not found")
+        u.face_embedding = None
+        u.face_enrolled_at = None
+        s.flush()
+        return FaceDeleteResponse(user_id=u.id, enrolled=False)

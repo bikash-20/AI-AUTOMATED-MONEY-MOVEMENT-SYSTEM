@@ -1,7 +1,18 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api } from "@/lib/api";
+import dynamic from "next/dynamic";
+import { Scan, ShieldCheck, Trash2 } from "lucide-react";
+import { api, FaceStatus } from "@/lib/api";
+import { readStoredEmbedding, clearStoredEmbedding } from "@/lib/face-storage";
+
+// Face ID is camera-heavy and uses tfjs/onnxruntime — only ever run in
+// the browser. Dynamic-import keeps the bundle small and SSR-safe.
+const FaceIDEnroll = dynamic(
+  () =>
+    import("@/components/FaceIDEnroll").then((m) => m.FaceIDEnroll),
+  { ssr: false }
+);
 
 type Settings = {
   ollama_url: string;
@@ -28,15 +39,19 @@ type Health = {
 export function SettingsModal({
   open,
   onClose,
+  userId,
 }: {
   open: boolean;
   onClose: () => void;
+  userId: number | null;
 }) {
   const [s, setS] = useState<Settings | null>(null);
   const [h, setH] = useState<Health | null>(null);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
+  const [faceStatus, setFaceStatus] = useState<FaceStatus | null>(null);
+  const [enrollOpen, setEnrollOpen] = useState(false);
 
   // Local form state — only commit on Save.
   const [ollamaUrl, setOllamaUrl] = useState("");
@@ -53,11 +68,15 @@ export function SettingsModal({
     if (!open) return;
     setErr(null);
     setOk(null);
-    Promise.all([api.getSettings(), api.getHealth()])
-      .then(([settings, health]) => {
+    const facePromise = userId !== null
+      ? api.getFaceStatus(userId).catch(() => null)
+      : Promise.resolve(null);
+    Promise.all([api.getSettings(), api.getHealth(), facePromise])
+      .then(([settings, health, face]) => {
         const st = settings as Settings;
         setS(st);
         setH(health);
+        setFaceStatus(face);
         setOllamaUrl(st.ollama_url);
         setCascade((st.llm_cascade || []).join(", "));
         setOrUrl(st.openrouter_url);
@@ -69,7 +88,7 @@ export function SettingsModal({
         setSttModel(st.stt_model);
       })
       .catch((e) => setErr(`Load failed: ${(e as Error).message}`));
-  }, [open]);
+  }, [open, userId]);
 
   async function save() {
     setSaving(true);
@@ -222,6 +241,112 @@ export function SettingsModal({
               onChange={setSttModel}
               placeholder="base | small | medium"
             />
+          </Section>
+
+          <Section title="Face ID">
+            {userId === null ? (
+              <p className="text-xs text-secondary">
+                Sign in to a user before enrolling Face ID.
+              </p>
+            ) : (
+              <>
+                <div className="flex items-center justify-between rounded-lg bg-white/5 border border-white/10 px-3 py-2">
+                  <div className="flex items-center gap-2">
+                    {faceStatus?.enrolled ? (
+                      <ShieldCheck
+                        size={16}
+                        strokeWidth={1.8}
+                        className="text-mint-400"
+                      />
+                    ) : (
+                      <Scan
+                        size={16}
+                        strokeWidth={1.8}
+                        className="text-secondary"
+                      />
+                    )}
+                    <div>
+                      <div className="text-sm text-cream">
+                        {faceStatus?.enrolled
+                          ? "Face ID enrolled"
+                          : "Face ID not enrolled"}
+                      </div>
+                      <div className="text-[11px] text-secondary">
+                        {faceStatus?.enrolled
+                          ? `Enrolled ${
+                              faceStatus.enrolled_at
+                                ? new Date(faceStatus.enrolled_at).toLocaleString()
+                                : ""
+                            }`
+                          : "Used to confirm payments instead of typing."}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setEnrollOpen(true)}
+                      className="btn-peach rounded-full px-3 py-1.5 text-xs font-semibold"
+                    >
+                      {faceStatus?.enrolled ? "Re-enroll" : "Enroll"}
+                    </button>
+                    {faceStatus?.enrolled ? (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          try {
+                            await api.deleteFace(userId);
+                            clearStoredEmbedding(userId);
+                            setFaceStatus({
+                              user_id: userId,
+                              enrolled: false,
+                              enrolled_at: null,
+                            });
+                          } catch (e) {
+                            setErr(
+                              `Remove failed: ${(e as Error).message}`
+                            );
+                          }
+                        }}
+                        className="btn-ghost rounded-full px-3 py-1.5 text-xs flex items-center gap-1"
+                        title="Remove Face ID enrollment"
+                      >
+                        <Trash2 size={12} strokeWidth={1.8} />
+                        Remove
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+                {enrollOpen ? (
+                  <FaceIDEnroll
+                    userId={userId}
+                    initialEnrolled={faceStatus?.enrolled ?? false}
+                    onClose={() => setEnrollOpen(false)}
+                    onEnrolled={() => {
+                      setEnrollOpen(false);
+                      // Refresh status so the section header updates.
+                      api
+                        .getFaceStatus(userId)
+                        .then(setFaceStatus)
+                        .catch(() => {});
+                    }}
+                    onDeleted={() => {
+                      setEnrollOpen(false);
+                      setFaceStatus({
+                        user_id: userId,
+                        enrolled: false,
+                        enrolled_at: null,
+                      });
+                    }}
+                  />
+                ) : null}
+                <p className="text-[11px] text-secondary">
+                  Matching runs entirely in your browser; only a 128-dim
+                  number array is stored on the server. Demo-only — not a
+                  security boundary.
+                </p>
+              </>
+            )}
           </Section>
 
           <div className="flex items-center justify-end gap-2 pt-2">

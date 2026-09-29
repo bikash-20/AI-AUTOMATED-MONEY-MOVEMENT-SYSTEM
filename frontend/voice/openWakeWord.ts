@@ -25,13 +25,28 @@
 // Resource cost on M4 Air 16GB: ~80MB RAM, ~3% CPU when idle listening.
 // The ONNX runtime uses wasm (single thread, no COOP/COEP headers needed).
 
-import { OpenWakeWord, configureOrt, type DetectionEvent } from "openwakeword-web";
+import {
+  OpenWakeWord,
+  configureOrt,
+  type DetectionEvent,
+} from "openwakeword-web";
 import { Microphone } from "openwakeword-web/microphone";
 
 export interface WakeWordCallbacks {
   onDetection: (event: DetectionEvent) => void;
   onError?: (err: Error) => void;
   onReady?: () => void; // fired when listener is up and listening
+}
+
+// Detect the webpack-stubbed "openwakeword-web" module. next.config.js
+// aliases this package to `false` so the build doesn't pull in
+// onnxruntime-web (and its `import.meta` ESM headache) into the main
+// bundle. When the stub is in place, every named export comes back as
+// `undefined`. We probe at runtime so the UI can degrade gracefully
+// (voice becomes unavailable, but the text + Face ID demo still works)
+// instead of throwing a cryptic "configureOrt is not a function" error.
+function isWakeWordStubbed(): boolean {
+  return typeof configureOrt !== "function" || typeof OpenWakeWord !== "function";
 }
 
 export class WakeWordListener {
@@ -49,6 +64,17 @@ export class WakeWordListener {
 
     this.startingPromise = (async () => {
       try {
+        // If the package was stubbed by webpack (see next.config.js),
+        // short-circuit with a clear error rather than letting the
+        // throw happen deep inside onnxruntime-web where the message
+        // is misleading.
+        if (isWakeWordStubbed()) {
+          throw new Error(
+            "openwakeword-web is not bundled in this build — voice commands are disabled. " +
+              "Text and Face ID flows still work."
+          );
+        }
+
         // Configure ONNX Runtime to use single-threaded wasm so the
         // page doesn't need COOP/COEP headers (Next.js dev server
         // doesn't send these by default).

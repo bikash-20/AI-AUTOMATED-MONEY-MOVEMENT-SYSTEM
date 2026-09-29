@@ -39,6 +39,18 @@ export type SavingsGoal = {
   target_date: string | null;
 };
 
+// ---- Face ID ---------------------------------------------------------------
+// 128-dim float vector produced by face-api.js. Stored on the server as an
+// opaque JSON blob — the API never echoes it back, so the frontend only
+// ever writes it on enrollment.
+export type FaceEmbedding = number[];
+
+export type FaceStatus = {
+  user_id: number;
+  enrolled: boolean;
+  enrolled_at: string | null;
+};
+
 export type ReviewCard = {
   kind: "send" | "request" | "split" | "pay_bill";
   amount_bdt: string;
@@ -207,4 +219,12 @@ export const api = {
   getSettings: () => httpJson<Record<string, unknown>>("GET", "/settings"),
   patchSettings: (patch: Record<string, unknown>) =>
     httpJson<Record<string, unknown>>("PATCH", "/settings", patch),
+
+  // ---- Face ID -----------------------------------------------------------
+  getFaceStatus: (userId: number) =>
+    httpJson<FaceStatus>("GET", `/users/${userId}/face/status`),
+  enrollFace: (userId: number, embedding: FaceEmbedding) =>
+    httpJson<FaceStatus>("POST", `/users/${userId}/face`, { embedding }),
+  deleteFace: (userId: number) =>
+    httpJson<{ user_id: number; enrolled: boolean }>("DELETE", `/users/${userId}/face`),
 };

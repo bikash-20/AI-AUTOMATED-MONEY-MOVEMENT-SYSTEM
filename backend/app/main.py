@@ -2,11 +2,17 @@
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import asynccontextmanager
+from datetime import datetime
+from decimal import Decimal
+from typing import Any
 
 import httpx
-from fastapi import Body, FastAPI
+from fastapi import Body, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from . import config, engine, voice_io
 from .db import SessionLocal, init_db
@@ -20,6 +26,45 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
 log = logging.getLogger("wallet")
+
+
+def _scrub_non_finite(value: Any) -> Any:
+    """Make a value JSON-safe for inclusion in a 422 error body.
+
+    FastAPI's default 422 echo includes the rejected input, which can
+    legitimately contain NaN/Inf (e.g. a face embedding with a bad
+    component), and Pydantic attaches validation context (Decimal,
+    datetime, raw ValueError instances, etc.) that the stdlib JSON
+    encoder cannot serialize. Without scrubbing, any of those would
+    500 the response instead of returning the correct 422.
+
+    The scrubber:
+      - replaces NaN/Inf floats with ``None``
+      - stringifies ``Decimal`` so the original value is still visible
+        (e.g. ``"Decimal('0.00')"``)
+      - stringifies exceptions (``"ValueError: ..."``)
+      - recurses through dicts/lists/tuples
+      - leaves JSON-native scalars untouched
+    """
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return None if not math.isfinite(value) else value
+    if isinstance(value, Decimal):
+        return f"Decimal('{value}')"
+    if isinstance(value, BaseException):
+        return f"{type(value).__name__}: {value}"
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        # Embeddings etc. — show length only, not raw bytes.
+        return f"<bytes len={len(value)}>"
+    if isinstance(value, dict):
+        return {k: _scrub_non_finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_scrub_non_finite(v) for v in value]
+    # Last-resort fallback for anything else (e.g. UUID, Path, custom).
+    return str(value)
 
 
 @asynccontextmanager
@@ -46,6 +91,21 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Wallet Demo", lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """Wrap FastAPI's default 422 with NaN/Inf scrubbing.
+
+    Without this, a request whose rejected payload contained NaN (which is
+    valid JSON via `NaN`/`Infinity` literals) would trigger a 500 from the
+    response encoder. We surface a clean 422 instead.
+    """
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _scrub_non_finite(exc.errors())},
+    )
+
 
 # CORS: same threat-model reasoning as ollama-local-model-website/voice_server.py.
 # Binds to 127.0.0.1 by default, no server-side state worth exfiltrating.
