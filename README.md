@@ -336,4 +336,3 @@ The deterministic transaction boundary and idempotency rules are the foundation 
 ## License
 
 No license has been selected yet. Add an explicit license before distributing this project publicly.
-# wallet-v2
